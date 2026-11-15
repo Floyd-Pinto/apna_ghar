@@ -104,7 +104,7 @@ export default function CreateProjectDialog({
         total_area_sqft: parseFloat(formData.total_area_sqft) || 0,
       };
 
-      const response = await fetch(`${API_BASE_URL}/api/projects/`, {
+      const response = await fetch(`${API_BASE_URL}/api/projects/projects/`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -114,8 +114,12 @@ export default function CreateProjectDialog({
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || "Failed to create project");
+        const errorData = await response.json().catch(() => ({}));
+        // DRF field errors look like {"slug": ["project with this slug already exists."]}
+        const fieldErrors = Object.entries(errorData)
+          .filter(([key]) => key !== "detail")
+          .map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(" ") : String(value)}`);
+        throw new Error(errorData.detail || fieldErrors.join(" • ") || "Failed to create project");
       }
 
       toast({

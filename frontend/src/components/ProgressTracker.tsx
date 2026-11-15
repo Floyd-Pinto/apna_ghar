@@ -29,6 +29,7 @@ import {
 import SecureUpload from "@/components/SecureUpload";
 import QRCodeDisplay from "@/components/QRCodeDisplay";
 import { API_BASE_URL } from "@/lib/config";
+import { apiRequest } from "@/services/api";
 
 interface Milestone {
   id: string;
@@ -75,6 +76,17 @@ export default function ProgressTracker({
   canManage = false,
 }: ProgressTrackerProps) {
   const { user } = useAuth();
+
+  // Admins independently verify milestones (builders can't verify their own work)
+  const verifyMilestone = async (milestoneId: string) => {
+    const res = await apiRequest(`/api/projects/milestones/${milestoneId}/verify/`, { method: "POST" });
+    if (res.ok) {
+      toast({ title: "Milestone verified" });
+      onMilestoneUpdate?.();
+    } else {
+      toast({ title: "Could not verify milestone", variant: "destructive" });
+    }
+  };
   const { toast } = useToast();
   const [uploadingMilestoneId, setUploadingMilestoneId] = useState<string | null>(null);
   const [showSecureUploadDialog, setShowSecureUploadDialog] = useState(false);
@@ -318,7 +330,11 @@ export default function ProgressTracker({
           {canManage && milestones.length === 0 && (
             <div className="bg-warning/10 border border-warning/30 rounded-lg p-4 text-center">
               <p className="text-sm text-warning">
-                📝 Create milestones in the admin panel to start tracking construction progress
+                Add milestones from{" "}
+                <a className="font-semibold underline" href={`/projects/${projectId}/qr-codes`}>
+                  Manage QR Codes
+                </a>{" "}
+                to start tracking construction progress
               </p>
             </div>
           )}
@@ -347,7 +363,12 @@ export default function ProgressTracker({
                   <Calendar className="h-12 w-12 mx-auto mb-3 opacity-50" />
                   <p>No milestones created yet</p>
                   {canManage && (
-                    <p className="text-xs mt-2">Create milestones in the admin panel to start tracking progress</p>
+                    <p className="text-xs mt-2">
+                      Add milestones from{" "}
+                      <a className="font-semibold underline" href={`/projects/${projectId}/qr-codes`}>
+                        Manage QR Codes
+                      </a>
+                    </p>
                   )}
                 </div>
                 
@@ -403,7 +424,7 @@ export default function ProgressTracker({
 
                       <div className="bg-info/10 rounded p-3 text-sm">
                         <p className="text-muted-foreground">
-                          <strong>Note:</strong> To upload media, you need to create milestones first in the admin panel.
+                          <strong>Note:</strong> To upload media, add a milestone first from Manage QR Codes.
                           Milestones help organize construction progress into phases.
                         </p>
                       </div>
@@ -435,11 +456,22 @@ export default function ProgressTracker({
                           <Badge className={`${getStatusColor(milestone.status)} text-xs`}>
                             {milestone.status.replace("_", " ")}
                           </Badge>
-                          {milestone.verified && (
+                          {milestone.verified ? (
                             <Badge variant="outline" className="text-success text-xs">
                               <CheckCircle2 className="h-3 w-3 mr-1" />
                               Verified
                             </Badge>
+                          ) : (
+                            user?.is_staff && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 px-2 text-xs"
+                                onClick={() => verifyMilestone(milestone.id)}
+                              >
+                                <CheckCircle2 className="h-3 w-3" /> Verify
+                              </Button>
+                            )
                           )}
                         </div>
                         <h4 className="font-semibold">{milestone.title}</h4>

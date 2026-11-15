@@ -242,3 +242,12 @@ class GoogleOAuthRedirect(View):
             logger.debug(f"Session ID: {request.session.session_key}")
             frontend_url = settings.FRONTEND_URL
             return redirect(f"{frontend_url}/login?error=oauth_failed")
+
+
+class AuthProvidersView(APIView):
+    """GET /api/auth/providers/ - which optional sign-in methods are configured (no auth needed)."""
+    permission_classes = (AllowAny,)
+
+    def get(self, request):
+        google = settings.SOCIALACCOUNT_PROVIDERS.get('google', {}).get('APP', {})
+        return Response({'google': bool(google.get('client_id') and google.get('secret'))})

@@ -58,6 +58,14 @@ class SupportTicketViewSet(viewsets.ModelViewSet):
         
         return queryset.order_by('-created_at')
     
+    def create(self, request, *args, **kwargs):
+        """Answer with the full ticket (id, ticket_number) rather than the create payload."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        full = SupportTicketSerializer(serializer.instance, context=self.get_serializer_context())
+        return Response(full.data, status=status.HTTP_201_CREATED)
+
     def perform_create(self, serializer):
         """Set user and handle ticket creation"""
         ticket = serializer.save(user=self.request.user)

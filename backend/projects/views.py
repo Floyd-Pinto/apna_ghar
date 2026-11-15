@@ -122,8 +122,14 @@ class ProjectViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         """Set developer to current user's developer profile"""
         developer = get_developer(self.request.user)
+        if developer is None and getattr(self.request.user, 'role', None) == 'builder':
+            # e.g. a builder whose profile was removed by a data import: give them a fresh one
+            from .signals import ensure_developer_profile
+            ensure_developer_profile(sender=None, instance=self.request.user)
+            self.request.user.refresh_from_db()
+            developer = get_developer(self.request.user)
         if developer is None:
-            raise DRFPermissionDenied('Only builders with a developer profile can create projects.')
+            raise DRFPermissionDenied('Only builder accounts can create projects.')
         project = serializer.save(developer=developer)
         
         # Store project creation on blockchain

@@ -4,7 +4,7 @@ from .admin_views import AdminUserListView, PromoteUserView, DemoteUserView, Boo
 from .views import (
     LoginView, RegisterView, LogoutView, UserProfileView, 
     GoogleOAuthRedirect, ChangePasswordView, UpdateUsernameView,
-    SetInitialPasswordView, UpdateRoleView
+    SetInitialPasswordView, UpdateRoleView, AuthProvidersView
 )
 
 urlpatterns = [
@@ -17,6 +17,7 @@ urlpatterns = [
     path('set-initial-password/', SetInitialPasswordView.as_view(), name='set_initial_password'),
     path('update-username/', UpdateUsernameView.as_view(), name='update_username'),
     path('update-role/', UpdateRoleView.as_view(), name='update_role'),
+    path('providers/', AuthProvidersView.as_view(), name='auth_providers'),
 
     # Admin management
     path('admin/users/', AdminUserListView.as_view(), name='admin_users'),

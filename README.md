@@ -16,15 +16,17 @@ cd ApnaGhar
 make up            # builds and starts everything
 ```
 
-Open **http://localhost:8080**. The first start takes a few minutes: the database is seeded with demo data, and the AI assistant builds its search index (`make logs s=rag` to watch).
+Open **http://localhost:8080**. The first start takes a few minutes: the database is loaded, and the AI assistant builds its search index (`make logs s=rag` to watch).
 
 | Account | Email | Password |
 | --- | --- | --- |
 | Admin | `admin@apnaghar.local` | `Admin@12345` (set `ADMIN_EMAIL` / `ADMIN_PASSWORD` in `.env`) |
-| Builder (demo) | `dev1@apnaghar.com` | `testpass123` |
+| Builder | `prestige.estates@builders.apnaghar.local` | `Builder@123` |
 | Buyer (demo) | `buyer1@apnaghar.com` | `testpass123` |
 
-To use your **old cloud data** instead of the demo data, run `make import-data`. It loads the export in `rag-pipeline/data/*.csv` (75 projects, about 9,200 units) and creates a builder login for each developer.
+On first start the database is filled from the **old cloud data export** (`rag-pipeline/data/*.csv`: 75 projects, about 9,200 units), and a builder login is created for each developer (for example `prestige.estates@builders.apnaghar.local` / `Builder@123`). Set `IMPORT_CLOUD_EXPORT=false` for generated demo data instead.
+
+**See [docs/DEMO_GUIDE.md](docs/DEMO_GUIDE.md) for every login and a step-by-step walkthrough for buyers, builders, the phone upload and admins.**
 
 ### What runs
 
@@ -148,7 +150,7 @@ frontend/        React app
 rag-pipeline/    AI assistant: data loader, embeddings, FAISS index, query engine (+ CSV export of the old DB)
 rag-service.py   Flask server for the AI assistant
 blockchain/      Fabric chaincode, Node.js API, setup scripts
-docs/            longer guides (deployment, blockchain verification)
+docs/            demo guide (logins, walkthroughs) and longer guides (deployment, blockchain)
 archive/         the original early prototype, kept for reference
 ```
 

@@ -49,7 +49,7 @@ const Header = () => {
     { to: "/", label: "Home", icon: Home, end: true, show: true },
     { to: "/explore-projects", label: "Explore", icon: Compass, end: false, show: isAuthenticated },
     { to: dashboardPath, label: "Dashboard", icon: LayoutDashboard, end: false, show: isAuthenticated },
-    { to: "/bookings", label: "Bookings", icon: CalendarCheck, end: false, show: isAuthenticated && user?.role !== "builder" },
+    { to: "/bookings", label: "Bookings", icon: CalendarCheck, end: false, show: isAuthenticated },
     { to: "/admin", label: "Admin", icon: ShieldCheck, end: false, show: isAuthenticated && !!user?.is_staff },
   ].filter((item) => item.show);
 

@@ -21,6 +21,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/hooks/use-toast';
 import QRCodeDisplay from '@/components/QRCodeDisplay';
 import SecureUpload from '@/components/SecureUpload';
+import AddMilestoneDialog from '@/components/AddMilestoneDialog';
 import {
   QrCode,
   Upload,
@@ -233,16 +234,23 @@ export default function ManageQRCodes() {
           <TabsContent value="milestones" className="space-y-4">
             <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 mb-4">
               <h2 className="text-xl font-semibold">Construction Milestones</h2>
-              <Button onClick={handleUpload} variant="outline" className="w-full sm:w-auto min-h-[44px]">
-                <Upload className="mr-2 h-4 w-4" />
-                Secure Upload
-              </Button>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <AddMilestoneDialog
+                  projectId={projectId!}
+                  nextPhase={milestones.length + 1}
+                  onCreated={fetchProjectData}
+                />
+                <Button onClick={handleUpload} variant="outline" className="w-full sm:w-auto">
+                  <Upload className="mr-2 h-4 w-4" />
+                  Secure Upload
+                </Button>
+              </div>
             </div>
 
             {milestones.length === 0 ? (
               <Card>
                 <CardContent className="py-8 text-center text-muted-foreground">
-                  No milestones found for this project
+                  No milestones yet. Add one to get a QR code for site uploads.
                 </CardContent>
               </Card>
             ) : (

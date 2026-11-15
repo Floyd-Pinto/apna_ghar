@@ -45,8 +45,9 @@ class AccessTestBase(TestCase):
         self.stranger = make_user('stranger@example.com')
         self.admin = make_user('admin@example.com', is_staff=True)
 
-        self.dev = Developer.objects.create(user=self.builder, company_name='Builder Co')
-        self.other_dev = Developer.objects.create(user=self.other_builder, company_name='Other Co')
+        # Builder accounts get a developer profile automatically (projects/signals.py)
+        self.dev = Developer.objects.get(user=self.builder)
+        self.other_dev = Developer.objects.get(user=self.other_builder)
         self.project = make_project(self.dev, 'Sea View')
         self.other_project = make_project(self.other_dev, 'Hill Top')
         self.sold_unit = make_unit(self.project, 'A-101', buyer=self.buyer)
@@ -352,3 +353,28 @@ class CaptureVerificationTests(AccessTestBase):
             resp = self.upload()  # the fix is in Mumbai
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.data['error_code'], 'OUTSIDE_GEOFENCE')
+
+
+class BuilderOnboardingTests(TestCase):
+    def test_new_builder_can_create_a_project(self):
+        client = APIClient()
+        resp = client.post('/api/auth/register/', {
+            'username': 'newbuilder', 'email': 'nb@example.com', 'password': 'Str0ng-pass!',
+            'password2': 'Str0ng-pass!', 'first_name': 'Nia', 'last_name': 'Rao', 'role': 'builder',
+        }, format='json')
+        self.assertIn(resp.status_code, (200, 201), resp.content)
+        user = User.objects.get(email='nb@example.com')
+        self.assertTrue(Developer.objects.filter(user=user).exists())
+
+        client.force_authenticate(user)
+        resp = client.post('/api/projects/projects/', {
+            'name': 'Nia Heights', 'slug': 'nia-heights', 'description': 'd', 'address': 'a',
+            'city': 'Pune', 'state': 'MH', 'pincode': '411001', 'starting_price': '5000000',
+        }, format='json')
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    def test_switching_to_builder_creates_profile(self):
+        user = make_user('switch@example.com')
+        user.role = 'builder'
+        user.save()
+        self.assertTrue(Developer.objects.filter(user=user).exists())
