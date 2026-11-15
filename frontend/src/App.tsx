@@ -1,0 +1,202 @@
+import { Toaster } from "@/components/ui/toaster";
+import { Toaster as Sonner } from "@/components/ui/sonner";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { BrowserRouter, Routes, Route, useLocation, Navigate } from "react-router-dom";
+import { AuthProvider, useAuth } from "./contexts/AuthContext";
+import { ThemeProvider } from "./contexts/ThemeContext";
+import ProtectedRoute from "./components/ProtectedRoute";
+import ErrorBoundary from "./components/ErrorBoundary";
+import Header from "./components/Header";
+import Footer from "./components/Footer";
+import Homepage from "./pages/Homepage";
+import ExploreProjects from "./pages/ExploreProjects";
+import ProjectOverview from "./pages/ProjectOverview";
+import PropertyUnitDetails from "./pages/PropertyUnitDetails";
+import BlockchainRecords from "./pages/BlockchainRecords";
+import BuyerDashboard from "./pages/BuyerDashboard";
+import BuilderDashboard from "./pages/BuilderDashboard";
+import ManageQRCodes from "./pages/ManageQRCodes";
+import Profile from "./pages/Profile";
+import Settings from "./pages/Settings";
+import LoginPage from "./pages/Login";
+import RegisterPage from "./pages/Register";
+import OAuthCallback from "./pages/OAuthCallback";
+import NotFound from "./pages/NotFound";
+import AIChatbot from "./components/AIChatbot";
+import MyBookings from "./pages/MyBookings";
+import BookingDetail from "./pages/BookingDetail";
+import Notifications from "./pages/Notifications";
+import SupportTickets from "./pages/SupportTickets";
+import SupportTicketDetail from "./pages/SupportTicketDetail";
+import AdminPanel from "./pages/AdminPanel";
+
+const queryClient = new QueryClient();
+
+// /dashboard -> the right dashboard for the signed-in user's role
+const DashboardRedirect = () => {
+  const { user } = useAuth();
+  return <Navigate to={user?.role === "builder" ? "/dashboard/builder" : "/dashboard/buyer"} replace />;
+};
+
+// Layout component that conditionally shows footer
+const Layout = () => {
+  const location = useLocation();
+  const showFooter = location.pathname === '/';
+
+  return (
+    <div className="min-h-screen flex flex-col overflow-x-hidden max-w-full">
+      <Header />
+      <main className="flex-1 overflow-x-hidden w-full max-w-full pt-16">
+        <Routes>
+          {/* Public routes */}
+          <Route path="/" element={<Homepage />} />
+          <Route path="/explore-projects" element={<ExploreProjects />} />
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/register" element={<RegisterPage />} />
+          <Route path="/auth/callback" element={<OAuthCallback />} />
+          
+          {/* Protected routes */}
+          <Route path="/projects/:id" element={<ProjectOverview />} />
+          <Route path="/property/:propertyId" element={<PropertyUnitDetails />} />
+          <Route 
+            path="/projects/:projectId/blockchain" 
+            element={
+              <ProtectedRoute>
+                <BlockchainRecords />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/dashboard" 
+            element={
+              <ProtectedRoute>
+                <DashboardRedirect />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/dashboard/buyer" 
+            element={
+              <ProtectedRoute>
+                <BuyerDashboard />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/dashboard/builder" 
+            element={
+              <ProtectedRoute>
+                <BuilderDashboard />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/projects/:projectId/qr-codes" 
+            element={
+              <ProtectedRoute>
+                <ManageQRCodes />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/profile" 
+            element={
+              <ProtectedRoute>
+                <Profile />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/settings" 
+            element={
+              <ProtectedRoute>
+                <Settings />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/bookings" 
+            element={
+              <ProtectedRoute>
+                <MyBookings />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/bookings/:id" 
+            element={
+              <ProtectedRoute>
+                <BookingDetail />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/notifications" 
+            element={
+              <ProtectedRoute>
+                <Notifications />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/support" 
+            element={
+              <ProtectedRoute>
+                <SupportTickets />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/support/:id" 
+            element={
+              <ProtectedRoute>
+                <SupportTicketDetail />
+              </ProtectedRoute>
+            } 
+          />
+          
+          <Route
+            path="/admin"
+            element={
+              <ProtectedRoute requireAdmin>
+                <AdminPanel />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* 404 catch-all route */}
+          <Route path="*" element={<NotFound />} />
+        </Routes>
+      </main>
+      {showFooter && <Footer />}
+      {/* AI Chatbot - Available on all pages */}
+      <AIChatbot />
+    </div>
+  );
+};
+
+const App = () => (
+  <ErrorBoundary>
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <ThemeProvider>
+          <AuthProvider>
+          <Toaster />
+          <Sonner />
+          <BrowserRouter
+            future={{
+              v7_startTransition: true,
+              v7_relativeSplatPath: true,
+            }}
+          >
+            <Layout />
+          </BrowserRouter>
+          </AuthProvider>
+        </ThemeProvider>
+      </TooltipProvider>
+    </QueryClientProvider>
+  </ErrorBoundary>
+);
+
+export default App;

@@ -1,0 +1,10 @@
+# Root context is only used by the RAG image
+**/node_modules
+**/venv
+**/__pycache__
+frontend/
+backend/
+blockchain/
+docs/
+.git/
+rag-pipeline/faiss_store/

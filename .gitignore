@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+db.sqlite3
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+media/
+
+backend/.env
+
+# Next.js
+.next/
+out/
+build/
+node_modules/
+.env*.local
+frontend/.env
+
+# misc
+.DS_Store
+*.pem
+.vercel
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# GitHub
+.github/
+
+# Logs
+logs/
+*.log
+*.env
+.env.*
+
+# RAG Pipeline - exclude env, cache, and data sources
+# The CSV data in rag-pipeline/data/ IS committed (the AI assistant and `make import-data` need it);
+# the FAISS index is rebuilt from it on first start
+rag-pipeline/faiss_store/
+rag-pipeline/.env
+rag-pipeline/__pycache__/
+rag-pipeline/**/__pycache__/
+rag-pipeline/.pytest_cache/
+rag-pipeline/notebooks/
+blockchain/fabric-samples/
+
+# Hyperledger Fabric samples are downloaded by blockchain/setup-fabric.sh
+blockchain/fabric-samples/
+
+# Local virtualenvs created by `make install`
+.venv/
+.venv-rag/
+
+# Example env files are documentation and must be committed
+!.env.example
+!**/.env.example

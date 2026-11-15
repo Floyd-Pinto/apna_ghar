@@ -1,0 +1,102 @@
+# Local ApnaGhar stack: Postgres + Django + Vite frontend + RAG chatbot + IPFS node.
+#   cp .env.example .env   (fill in what you have; everything is optional)
+#   docker compose up --build        ->  http://localhost:8080
+# The Hyperledger Fabric network is optional and runs on the host (`make fabric`).
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: apnaghar
+      POSTGRES_USER: apnaghar
+      POSTGRES_PASSWORD: apnaghar
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apnaghar"]
+      interval: 3s
+      retries: 20
+
+  ipfs:
+    # Self-hosted IPFS node replacing Pinata: documents get real CIDs, pinned locally
+    image: ipfs/kubo:v0.32.1
+    volumes:
+      - ipfsdata:/data/ipfs
+    ports:
+      - "127.0.0.1:5001:5001"   # API (backend only)
+      - "127.0.0.1:8081:8080"   # gateway (browsers reach it via the frontend's /ipfs proxy)
+
+  backend:
+    build:
+      context: ./backend
+      network: host   # builds work even when a host firewall (e.g. ufw) blocks Docker's bridge
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://apnaghar:apnaghar@db:5432/apnaghar
+      DEBUG: "True"
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@apnaghar.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin@12345}
+      IPFS_API_URL: http://ipfs:5001
+      IPFS_GATEWAY_URL: /ipfs/
+      RAG_SERVICE_URL: http://rag:8001
+      RAG_DATA_DIR: /rag-data
+      # First start: load the old cloud data (rag-pipeline/data/*.csv) so the site matches the chatbot
+      IMPORT_CLOUD_EXPORT: ${IMPORT_CLOUD_EXPORT:-true}
+      BLOCKCHAIN_API_URL: ${BLOCKCHAIN_API_URL:-http://host.docker.internal:3000/api/v1}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
+      BACKEND_URL: ${BACKEND_URL:-http://localhost:8080}
+    volumes:
+      - ./backend:/app
+      - media:/app/media
+      - ./rag-pipeline/data:/rag-data
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      ipfs:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      network: host
+    environment:
+      VITE_API_BASE_URL: ""            # same origin -> Vite proxy
+      VITE_PROXY_TARGET: http://backend:8000
+      VITE_IPFS_GATEWAY_TARGET: http://ipfs:8080
+      VITE_HTTPS: ${VITE_HTTPS:-false}
+      VITE_RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend
+
+  rag:
+    build:
+      context: .
+      dockerfile: rag-pipeline/Dockerfile
+      network: host
+    environment:
+      RAG_PORT: "8001"
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    volumes:
+      - ./rag-pipeline/data:/app/rag-pipeline/data
+      - faiss:/app/rag-pipeline/faiss_store
+    ports:
+      - "127.0.0.1:8001:8001"
+
+volumes:
+  pgdata:
+  ipfsdata:
+  media:
+  faiss:

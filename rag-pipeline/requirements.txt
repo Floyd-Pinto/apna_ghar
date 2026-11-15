@@ -1,0 +1,13 @@
+# RAG chatbot service (rag-service.py). Install CPU-only PyTorch first to keep it small:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+sentence-transformers>=3.0,<6
+faiss-cpu>=1.9.0
+numpy>=1.26.0
+pandas>=2.1.0
+langchain-core>=0.3,<1.1
+langchain-text-splitters>=0.3,<1.1
+langchain-groq>=0.2,<1.1
+python-dotenv>=1.0.0
+flask>=3.0,<4
+flask-cors>=5.0,<7
+requests>=2.31.0

@@ -1,0 +1,1076 @@
+import { useState, useEffect } from "react";
+import { usePageView } from "@/hooks/useAnalytics";
+import { Link } from "react-router-dom";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import {
+  Plus,
+  Building2,
+  Eye,
+  Users,
+  TrendingUp,
+  FileText,
+  Upload,
+  Settings,
+  Camera,
+  MessageSquare,
+  CheckCircle2,
+  AlertCircle,
+  Clock,
+  BarChart3,
+  Loader2,
+  MapPin,
+  QrCode,
+  Calendar,
+  ArrowRight,
+  XCircle,
+} from "lucide-react";
+import { useAuth } from "@/contexts/AuthContext";
+import { useToast } from "@/hooks/use-toast";
+import CreateProjectDialog from "@/components/CreateProjectDialog";
+import { bookingAPI, Booking } from "@/services/api";
+import { useNavigate } from "react-router-dom";
+import { API_BASE_URL } from "@/lib/config";
+
+
+import PageHeader from "@/components/PageHeader";
+interface Project {
+  id: string;
+  name: string;
+  slug: string;
+  city: string;
+  state: string;
+  status: string;
+  project_type: string;
+  views_count: number;
+  interested_count: number;
+  total_units: number;
+  available_units: number;
+  cover_image: string | null;
+  created_at: string;
+}
+
+interface Milestone {
+  id: string;
+  project: string;
+  title: string;
+  description: string;
+  status: string;
+  progress_percentage: string;
+  images: any[];
+  videos: any[];
+  verified: boolean;
+}
+
+interface ConstructionUpdate {
+  id: string;
+  project: string;
+  project_name?: string;
+  title: string;
+  description: string;
+  update_date: string;
+  update_type: string;
+  images: any[];
+  videos: any[];
+  completion_percentage: string | null;
+  milestone_achieved: string | null;
+  property_unit_number: string | null;
+  created_at: string;
+}
+
+interface Inquiry {
+  id: string;
+  project_id: string;
+  project_name: string;
+  buyer_name: string;
+  buyer_email: string;
+  buyer_phone?: string;
+  message: string;
+  status: string;
+  created_at: string;
+}
+
+export default function BuilderDashboard() {
+  const { user, isLoading: authLoading } = useAuth();
+  const { toast } = useToast();
+  const navigate = useNavigate();
+  usePageView(); // Track page view
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [milestones, setMilestones] = useState<Milestone[]>([]);
+  const [inquiries, setInquiries] = useState<Inquiry[]>([]);
+  const [bookings, setBookings] = useState<Booking[]>([]);
+  const [constructionUpdates, setConstructionUpdates] = useState<ConstructionUpdate[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
+
+  useEffect(() => {
+    // Only load when auth is complete and user exists
+    if (!authLoading && user) {
+      loadProjects();
+    }
+  }, [authLoading, user]);
+
+  const loadProjects = async () => {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const token = localStorage.getItem("access_token");
+      if (!token) {
+        setError("No authentication token found");
+        setLoading(false);
+        return;
+      }
+
+      const response = await fetch(
+        `${API_BASE_URL}/api/projects/projects/my_projects/`,
+        {
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      if (response.status === 403) {
+        setProjects([]);
+        setMilestones([]);
+        setInquiries([]);
+      } else if (!response.ok) {
+        throw new Error(`Failed to load projects: ${response.status}`);
+      } else {
+        const data = await response.json();
+        const projectsList = data.results || data;
+        const projectsArray = Array.isArray(projectsList) ? projectsList : [];
+        setProjects(projectsArray);
+        setMilestones([]);
+
+        // Fetch construction updates for all projects
+        if (projectsArray.length > 0) {
+          await loadConstructionUpdates(projectsArray.map(p => p.id));
+
+          // Fetch bookings for builder's projects
+          try {
+            const bookingsData = await bookingAPI.getAll();
+            setBookings(Array.isArray(bookingsData) ? bookingsData : []);
+          } catch (error: any) {
+            setBookings([]);
+          }
+
+          setInquiries([
+            {
+              id: "1",
+              project_id: projectsArray[0]?.id || "",
+              project_name: projectsArray[0]?.name || "Sample Project",
+              buyer_name: "Rahul Sharma",
+              buyer_email: "rahul.sharma@example.com",
+              buyer_phone: "+91 98765 43210",
+              message: "I'm interested in 3BHK units. Can you share more details about the pricing and payment plans? Also, when is the expected possession date?",
+              status: "new",
+              created_at: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(), // 2 hours ago
+            },
+            {
+              id: "2",
+              project_id: projectsArray[0]?.id || "",
+              project_name: projectsArray[0]?.name || "Sample Project",
+              buyer_name: "Priya Patel",
+              buyer_email: "priya.patel@gmail.com",
+              buyer_phone: "+91 98765 43211",
+              message: "Looking for a 2BHK apartment on a higher floor with good ventilation. What are the available options?",
+              status: "new",
+              created_at: new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(), // 5 hours ago
+            },
+            {
+              id: "3",
+              project_id: projectsArray[1]?.id || projectsArray[0]?.id || "",
+              project_name: projectsArray[1]?.name || projectsArray[0]?.name || "Sample Project",
+              buyer_name: "Amit Kumar",
+              buyer_email: "amit.k@yahoo.com",
+              buyer_phone: "+91 98765 43212",
+              message: "I visited the site yesterday. Very impressed! Can we schedule a meeting to discuss the booking process?",
+              status: "responded",
+              created_at: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(), // 1 day ago
+            },
+            {
+              id: "4",
+              project_id: projectsArray[0]?.id || "",
+              project_name: projectsArray[0]?.name || "Sample Project",
+              buyer_name: "Sneha Desai",
+              buyer_email: "sneha.desai@hotmail.com",
+              buyer_phone: "+91 98765 43213",
+              message: "Is home loan assistance available? Also, what are the amenities included in the project?",
+              status: "new",
+              created_at: new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString(), // 8 hours ago
+            },
+            {
+              id: "5",
+              project_id: projectsArray[1]?.id || projectsArray[0]?.id || "",
+              project_name: projectsArray[1]?.name || projectsArray[0]?.name || "Sample Project",
+              buyer_name: "Vikram Singh",
+              buyer_email: "vikram.singh@outlook.com",
+              buyer_phone: "+91 98765 43214",
+              message: "Interested in investing. Do you have any units available for immediate possession? What's the rental yield in this area?",
+              status: "new",
+              created_at: new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString(), // 12 hours ago
+            },
+            {
+              id: "6",
+              project_id: projectsArray[0]?.id || "",
+              project_name: projectsArray[0]?.name || "Sample Project",
+              buyer_name: "Anjali Mehta",
+              buyer_email: "anjali.mehta@gmail.com",
+              buyer_phone: "+91 98765 43215",
+              message: "Can you share the floor plans and virtual tour? I'm currently based in Dubai and planning to invest in Mumbai.",
+              status: "responded",
+              created_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(), // 2 days ago
+            },
+            {
+              id: "7",
+              project_id: projectsArray[1]?.id || projectsArray[0]?.id || "",
+              project_name: projectsArray[1]?.name || projectsArray[0]?.name || "Sample Project",
+              buyer_name: "Rajesh Gupta",
+              buyer_email: "rajesh.gupta@company.com",
+              buyer_phone: "+91 98765 43216",
+              message: "Looking for 4BHK penthouse. What are the customization options available? Also interested in knowing about the security features.",
+              status: "new",
+              created_at: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(), // 6 hours ago
+            },
+            {
+              id: "8",
+              project_id: projectsArray[0]?.id || "",
+              project_name: projectsArray[0]?.name || "Sample Project",
+              buyer_name: "Kavita Reddy",
+              buyer_email: "kavita.reddy@email.com",
+              buyer_phone: "+91 98765 43217",
+              message: "Is parking included? How many parking spaces per unit? Also, what about the maintenance charges?",
+              status: "new",
+              created_at: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), // 3 hours ago
+            },
+          ]);
+        } else {
+          setInquiries([]);
+          setConstructionUpdates([]);
+          setBookings([]);
+        }
+      }
+    } catch (err: any) {
+      setError(err.message || "Failed to load projects");
+      setProjects([]);
+      setMilestones([]);
+      setInquiries([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadConstructionUpdates = async (projectIds: string[]) => {
+    try {
+      const token = localStorage.getItem("access_token");
+      if (!token) return;
+
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      };
+
+      // Fetch updates for all projects
+      const updatePromises = projectIds.map(async (projectId) => {
+        try {
+          const response = await fetch(
+            `${API_BASE_URL}/api/projects/construction-updates/project/${projectId}/`,
+            { headers }
+          );
+          if (response.ok) {
+            const data = await response.json();
+            return Array.isArray(data) ? data : [];
+          }
+          return [];
+        } catch (error) {
+          return [];
+        }
+      });
+
+      const allUpdates = await Promise.all(updatePromises);
+      const flattenedUpdates = allUpdates.flat();
+      setConstructionUpdates(flattenedUpdates);
+    } catch (error) {
+      console.error("Error loading construction updates:", error);
+      setConstructionUpdates([]);
+    }
+  };
+
+  const totalViews = projects.reduce((sum, p) => sum + p.views_count, 0);
+  const totalInterested = projects.reduce((sum, p) => sum + p.interested_count, 0);
+  const conversionRate = totalViews > 0 ? ((totalInterested / totalViews) * 100).toFixed(1) : "0";
+
+  const stats = [
+    {
+      title: "Active Projects",
+      value: projects.length.toString(),
+      icon: Building2,
+      description: "Projects currently listed",
+    },
+    {
+      title: "Total Views",
+      value: totalViews.toString(),
+      icon: Eye,
+      description: "Across all projects",
+    },
+    {
+      title: "Inquiries",
+      value: inquiries.length.toString(),
+      icon: Users,
+      description: "Potential buyers",
+    },
+    {
+      title: "Conversion Rate",
+      value: `${conversionRate}%`,
+      icon: TrendingUp,
+      description: "Views to interest",
+    },
+    {
+      title: "Total Bookings",
+      value: loading ? "..." : bookings.length.toString(),
+      icon: Calendar,
+      description: "All bookings",
+    },
+  ];
+
+  // Show loading only during initial auth check
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <Loader2 className="h-12 w-12 animate-spin text-primary" />
+          <p className="text-sm text-muted-foreground">Loading dashboard...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Check role after loading is complete
+  if (user?.role !== 'builder') {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <Card className="max-w-md mx-4">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <AlertCircle className="h-6 w-6 text-destructive" />
+              Access Denied
+            </CardTitle>
+            <CardDescription>
+              This dashboard is only accessible to builders
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Your account role: <strong>{user?.role || 'Not set'}</strong>
+            </p>
+            <Link to="/">
+              <Button className="w-full">Go to Home</Button>
+            </Link>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  // Show error state
+  if (error) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center p-4">
+        <Card className="max-w-md w-full">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-destructive">
+              <AlertCircle className="h-6 w-6" />
+              Error Loading Dashboard
+            </CardTitle>
+            <CardDescription>{error}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <Button onClick={loadProjects} className="w-full">
+              Retry Loading
+            </Button>
+            <Button variant="outline" onClick={() => window.location.reload()} className="w-full">
+              Refresh Page
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  // Main dashboard content - only render when everything is ready
+  return (
+    <div className="min-h-screen">
+      <PageHeader
+        eyebrow="Builder dashboard"
+        title={`Welcome back, ${user?.first_name || "there"}`}
+        description="Manage your projects, publish verified construction updates and respond to buyers."
+      />
+
+      <div className="container py-6 sm:py-8">
+        {/* Stats Grid */}
+        {loading && (
+          <div className="flex items-center justify-center py-4 mb-4">
+            <Loader2 className="h-6 w-6 animate-spin text-primary mr-2" />
+            <span className="text-sm text-muted-foreground">Loading dashboard data...</span>
+          </div>
+        )}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-6 mb-6 sm:mb-8">
+          {stats.map((stat) => (
+            <Card key={stat.title}>
+              <CardContent className="pt-4 sm:pt-6 flex flex-col items-center text-center">
+                <div className="flex flex-col items-center gap-2 mb-3">
+                  <stat.icon className="h-6 w-6 sm:h-8 sm:w-8 text-primary" />
+                  <span className="text-xl sm:text-2xl md:text-3xl font-bold">{stat.value}</span>
+                </div>
+                <h3 className="font-semibold text-xs sm:text-sm md:text-base">{stat.title}</h3>
+                <p className="text-[10px] sm:text-xs md:text-sm text-muted-foreground">{stat.description}</p>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+
+        {/* Tabs */}
+        <Tabs defaultValue="projects" className="w-full">
+          <div className="overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0">
+            <TabsList className="inline-flex md:grid w-auto md:w-full grid-cols-4 min-w-max md:min-w-0">
+              <TabsTrigger value="projects" className="text-xs sm:text-sm whitespace-nowrap">
+                <Building2 className="h-4 w-4 mr-2" />
+                My Projects
+              </TabsTrigger>
+              <TabsTrigger value="updates" className="text-xs sm:text-sm whitespace-nowrap">
+                <Upload className="h-4 w-4 mr-2" />
+                Construction Updates
+              </TabsTrigger>
+              <TabsTrigger value="inquiries" className="text-xs sm:text-sm whitespace-nowrap">
+                <Users className="h-4 w-4 mr-2" />
+                Inquiries
+              </TabsTrigger>
+              <TabsTrigger value="analytics" className="text-xs sm:text-sm whitespace-nowrap">
+                <TrendingUp className="h-4 w-4 mr-2" />
+                Analytics
+              </TabsTrigger>
+            </TabsList>
+          </div>
+
+          <TabsContent value="projects" className="mt-6">
+            <Card>
+              <CardHeader className="flex flex-col sm:flex-row items-center justify-between gap-4 text-center sm:text-left">
+                <div className="w-full sm:w-auto">
+                  <CardTitle className="text-center sm:text-left">My Projects</CardTitle>
+                  <CardDescription className="text-center sm:text-left">
+                    Manage your listed projects
+                  </CardDescription>
+                </div>
+                <Button onClick={() => setCreateDialogOpen(true)} className="w-full sm:w-auto">
+                  <Plus className="h-4 w-4 mr-2" />
+                  Add Project
+                </Button>
+              </CardHeader>
+              <CardContent>
+                {projects.length === 0 ? (
+                  <div className="text-center py-12">
+                    <Building2 className="h-16 w-16 mx-auto text-muted-foreground mb-4" />
+                    <h3 className="text-xl font-semibold mb-2">No projects yet</h3>
+                    <p className="text-muted-foreground mb-4">Start by posting your first project</p>
+                    <Button size="lg" onClick={() => setCreateDialogOpen(true)} className="w-full sm:w-auto">
+                      <Plus className="h-5 w-5 mr-2" />
+                      Post New Project
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="space-y-4 md:space-y-6">
+                    {projects.map((project) => (
+                      <Card key={project.id} className="overflow-hidden hover:shadow-lg transition-shadow">
+                        <div className="flex flex-col md:flex-row">
+                          {project.cover_image && (
+                            <div className="w-full md:w-64 h-48 md:h-auto flex-shrink-0">
+                              <img
+                                src={project.cover_image}
+                                alt={project.name}
+                                className="w-full h-full object-cover"
+                                loading="lazy"
+                              />
+                            </div>
+                          )}
+
+                          <div className="flex-1 p-4 sm:p-6">
+                            <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-2 sm:gap-4 mb-3 sm:mb-4">
+                              <div className="flex-1 min-w-0">
+                                <div className="flex flex-wrap items-center gap-2 mb-2">
+                                  <h3 className="text-lg sm:text-xl md:text-2xl font-bold break-words">{project.name}</h3>
+                                  <Badge variant={project.status === "ongoing" ? "default" : "secondary"} className="text-xs flex-shrink-0">
+                                    {project.status}
+                                  </Badge>
+                                  <Badge variant="outline" className="text-xs flex-shrink-0">
+                                    {project.project_type}
+                                  </Badge>
+                                </div>
+                                <p className="text-xs sm:text-sm text-muted-foreground flex items-center gap-1 break-words">
+                                  <MapPin className="h-3 w-3 flex-shrink-0" />
+                                  {project.city}, {project.state}
+                                </p>
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-3 gap-2 sm:gap-4 mb-4 sm:mb-6 p-3 sm:p-4 bg-muted/30 rounded-lg">
+                              <div className="text-center">
+                                <div className="flex items-center justify-center gap-1 mb-1">
+                                  <Eye className="h-3 w-3 sm:h-4 sm:w-4 text-primary" />
+                                  <span className="text-sm sm:text-lg font-bold">{project.views_count}</span>
+                                </div>
+                                <p className="text-[10px] sm:text-xs text-muted-foreground">Views</p>
+                              </div>
+                              <div className="text-center border-x">
+                                <div className="flex items-center justify-center gap-1 mb-1">
+                                  <Users className="h-3 w-3 sm:h-4 sm:w-4 text-primary" />
+                                  <span className="text-sm sm:text-lg font-bold">{project.interested_count}</span>
+                                </div>
+                                <p className="text-[10px] sm:text-xs text-muted-foreground">Interested</p>
+                              </div>
+                              <div className="text-center">
+                                <div className="flex items-center justify-center gap-1 mb-1">
+                                  <Building2 className="h-3 w-3 sm:h-4 sm:w-4 text-primary" />
+                                  <span className="text-sm sm:text-lg font-bold">{project.available_units}/{project.total_units}</span>
+                                </div>
+                                <p className="text-[10px] sm:text-xs text-muted-foreground">Available</p>
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-1 sm:flex sm:flex-wrap gap-2 w-full">
+                              <Link to={`/projects/${project.id}`} className="w-full sm:flex-1 sm:min-w-[120px]">
+                                <Button variant="outline" size="sm" className="w-full text-xs sm:text-sm min-h-[44px]">
+                                  <Eye className="h-3 w-3 sm:h-4 sm:w-4 mr-1 sm:mr-2" />
+                                  <span className="truncate">View Project</span>
+                                </Button>
+                              </Link>
+                              <Link to={`/projects/${project.id}/qr-codes`} className="w-full sm:flex-1 sm:min-w-[120px]">
+                                <Button variant="outline" size="sm" className="w-full text-xs sm:text-sm min-h-[44px]">
+                                  <QrCode className="h-3 w-3 sm:h-4 sm:w-4 mr-1 sm:mr-2" />
+                                  <span className="truncate">Show QR</span>
+                                </Button>
+                              </Link>
+                              <Link to={`/projects/${project.id}?edit=true`} className="w-full sm:flex-1 sm:min-w-[100px]">
+                                <Button variant="outline" size="sm" className="w-full text-xs sm:text-sm min-h-[44px]">
+                                  <Settings className="h-3 w-3 sm:h-4 sm:w-4 mr-1 sm:mr-2" />
+                                  <span className="truncate">Edit</span>
+                                </Button>
+                              </Link>
+                            </div>
+                          </div>
+                        </div>
+                      </Card>
+                    ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="bookings" className="mt-6">
+            <Card>
+              <CardHeader className="text-center space-y-2">
+                <CardTitle>Project Bookings</CardTitle>
+                <CardDescription>Manage all bookings for your projects</CardDescription>
+              </CardHeader>
+              <CardContent>
+                {bookings.length === 0 ? (
+                  <div className="text-center py-12">
+                    <Calendar className="h-16 w-16 mx-auto text-muted-foreground mb-4" />
+                    <h3 className="text-xl font-semibold mb-2">No bookings yet</h3>
+                    <p className="text-muted-foreground mb-6">Bookings from buyers will appear here</p>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {bookings.map((booking) => {
+                      const getStatusBadge = (status: string) => {
+                        const statusConfig: { [key: string]: { label: string; variant: "default" | "secondary" | "destructive" | "outline"; icon: any } } = {
+                          pending: { label: "Pending", variant: "outline", icon: Clock },
+                          token_paid: { label: "Token Paid", variant: "secondary", icon: CheckCircle2 },
+                          confirmed: { label: "Confirmed", variant: "default", icon: CheckCircle2 },
+                          agreement_pending: { label: "Agreement Pending", variant: "outline", icon: FileText },
+                          agreement_signed: { label: "Agreement Signed", variant: "default", icon: FileText },
+                          payment_in_progress: { label: "Payment In Progress", variant: "secondary", icon: Clock },
+                          completed: { label: "Completed", variant: "default", icon: CheckCircle2 },
+                          cancelled: { label: "Cancelled", variant: "destructive", icon: XCircle },
+                          refund_pending: { label: "Refund Pending", variant: "outline", icon: Clock },
+                          refunded: { label: "Refunded", variant: "secondary", icon: XCircle },
+                        };
+                        const config = statusConfig[status] || { label: status, variant: "outline" as const, icon: Clock };
+                        const Icon = config.icon;
+                        return (
+                          <Badge variant={config.variant} className="flex items-center gap-1">
+                            <Icon className="h-3 w-3" />
+                            {config.label}
+                          </Badge>
+                        );
+                      };
+
+                      const formatPrice = (price: string) => {
+                        const num = parseFloat(price);
+                        if (num >= 10000000) return `₹${(num / 10000000).toFixed(2)} Cr`;
+                        if (num >= 100000) return `₹${(num / 100000).toFixed(2)} L`;
+                        return `₹${num.toLocaleString("en-IN")}`;
+                      };
+
+                      return (
+                        <Card key={booking.id} className="hover:shadow-md transition-shadow">
+                          <CardContent className="pt-6">
+                            <div className="flex items-start justify-between mb-4">
+                              <div className="flex-1">
+                                <div className="flex items-center gap-2 mb-2">
+                                  <h3 className="font-semibold text-lg">{booking.project_name}</h3>
+                                  {getStatusBadge(booking.status)}
+                                </div>
+                                <p className="text-sm text-muted-foreground mb-1">
+                                  Unit {booking.property_unit_number} • {booking.property_type}
+                                </p>
+                                <p className="text-xs text-muted-foreground mb-2">
+                                  Booking #{booking.booking_number}
+                                </p>
+                                <div className="flex items-center gap-4 text-sm">
+                                  <div>
+                                    <span className="text-muted-foreground">Buyer: </span>
+                                    <span className="font-semibold">{booking.buyer_name}</span>
+                                  </div>
+                                  <div>
+                                    <span className="text-muted-foreground">Email: </span>
+                                    <span className="font-semibold">{booking.buyer_email}</span>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                            <div className="grid grid-cols-3 gap-4 mb-4">
+                              <div>
+                                <p className="text-xs text-muted-foreground mb-1">Total Amount</p>
+                                <p className="font-semibold">{formatPrice(booking.total_amount)}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-muted-foreground mb-1">Amount Paid</p>
+                                <p className="font-semibold text-success">{formatPrice(booking.amount_paid)}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-muted-foreground mb-1">Amount Due</p>
+                                <p className="font-semibold text-destructive">{formatPrice(booking.amount_due)}</p>
+                              </div>
+                            </div>
+                            <div className="flex gap-2">
+                              <Button
+                                variant="outline"
+                                className="flex-1"
+                                onClick={() => navigate(`/bookings/${booking.id}`)}
+                              >
+                                View Details
+                                <ArrowRight className="h-4 w-4 ml-2" />
+                              </Button>
+                              {(booking.status === "pending" || booking.status === "token_paid") && (
+                                <Button
+                                  variant="default"
+                                  onClick={async () => {
+                                    try {
+                                      await bookingAPI.confirm(booking.id);
+                                      toast({
+                                        title: "Booking Confirmed",
+                                        description: "Booking has been confirmed successfully",
+                                      });
+                                      loadProjects();
+                                    } catch (error: any) {
+                                      toast({
+                                        title: "Confirmation Failed",
+                                        description: error.message || "Failed to confirm booking",
+                                        variant: "destructive",
+                                      });
+                                    }
+                                  }}
+                                >
+                                  <CheckCircle2 className="h-4 w-4 mr-2" />
+                                  Confirm
+                                </Button>
+                              )}
+                            </div>
+                          </CardContent>
+                        </Card>
+                      );
+                    })}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="updates" className="mt-6">
+            <Card>
+              <CardHeader>
+                <CardTitle>Construction Updates Overview</CardTitle>
+                <CardDescription>
+                  View all construction progress across your projects (Upload from project details page)
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                {constructionUpdates.length === 0 ? (
+                  <div className="text-center py-12">
+                    <Upload className="h-16 w-16 mx-auto text-muted-foreground mb-4" />
+                    <h3 className="text-xl font-semibold mb-2">No construction updates yet</h3>
+                    <p className="text-muted-foreground mb-6">
+                      Construction updates from your projects will appear here
+                    </p>
+                    <p className="text-sm text-muted-foreground">
+                      To upload updates, go to the specific project's Progress tab
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    {projects.map((project) => {
+                      const projectUpdates = constructionUpdates.filter((u) => u.project === project.id);
+                      if (projectUpdates.length === 0) return null;
+
+                      return (
+                        <div key={project.id} className="space-y-3">
+                          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                            <h3 className="text-lg font-semibold flex items-center gap-2">
+                              <Building2 className="h-5 w-5 text-primary" />
+                              {project.name}
+                            </h3>
+                            <Link to={`/projects/${project.id}?tab=progress`}>
+                              <Button variant="outline" size="default" className="w-full sm:w-auto min-h-[44px]">
+                                <Upload className="h-4 w-4 mr-2" />
+                                Upload More
+                              </Button>
+                            </Link>
+                          </div>
+
+                          <div className="space-y-3">
+                            {projectUpdates.map((update) => (
+                              <Card key={update.id} className="bg-muted/30">
+                                <CardContent className="pt-4">
+                                  <div className="flex items-start gap-4">
+                                    <div className="flex-1">
+                                      <div className="flex items-center gap-2 mb-2">
+                                        <h4 className="font-semibold">{update.title}</h4>
+                                        <Badge variant="outline" className="text-xs">
+                                          {update.update_type === 'project_level' ? 'Project Level' : 'Property Specific'}
+                                        </Badge>
+                                        {update.property_unit_number && (
+                                          <Badge variant="secondary" className="text-xs">
+                                            Unit {update.property_unit_number}
+                                          </Badge>
+                                        )}
+                                      </div>
+                                      <p className="text-sm text-muted-foreground mb-2">{update.description}</p>
+                                      <div className="text-xs text-muted-foreground mb-3">
+                                        {new Date(update.update_date).toLocaleDateString()}
+                                      </div>
+                                      <div className="flex items-center gap-4 text-sm">
+                                        <div className="flex items-center gap-2">
+                                          <Camera className="h-4 w-4 text-primary" />
+                                          <span className="font-medium">{update.images?.length || 0}</span>
+                                          <span className="text-muted-foreground">photos</span>
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                          <FileText className="h-4 w-4 text-primary" />
+                                          <span className="font-medium">{update.videos?.length || 0}</span>
+                                          <span className="text-muted-foreground">videos</span>
+                                        </div>
+                                        {update.completion_percentage && (
+                                          <>
+                                            <div className="flex-1">
+                                              <Progress value={parseFloat(update.completion_percentage)} className="h-2" />
+                                            </div>
+                                            <span className="font-semibold text-primary">
+                                              {parseFloat(update.completion_percentage).toFixed(0)}%
+                                            </span>
+                                          </>
+                                        )}
+                                      </div>
+                                      {update.milestone_achieved && (
+                                        <div className="mt-2">
+                                          <Badge variant="default" className="text-xs">
+                                            <CheckCircle2 className="h-3 w-3 mr-1" />
+                                            {update.milestone_achieved}
+                                          </Badge>
+                                        </div>
+                                      )}
+                                    </div>
+
+                                    {update.images && update.images.length > 0 && (
+                                      <div className="flex gap-2">
+                                        {update.images.slice(0, 3).map((image: any, idx: number) => (
+                                          <div key={idx} className="w-20 h-20 rounded overflow-hidden">
+                                            <img
+                                              src={image.url || image}
+                                              alt={`Preview ${idx + 1}`}
+                                              className="w-full h-full object-cover"
+                                              loading="lazy"
+                                            />
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                </CardContent>
+                              </Card>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="inquiries" className="mt-6">
+            <Card>
+              <CardHeader>
+                <CardTitle>Buyer Inquiries</CardTitle>
+                <CardDescription>Messages and leads from interested buyers</CardDescription>
+              </CardHeader>
+              <CardContent>
+                {inquiries.length === 0 ? (
+                  <div className="text-center py-12">
+                    <Users className="h-16 w-16 mx-auto text-muted-foreground mb-4" />
+                    <h3 className="text-xl font-semibold mb-2">No inquiries yet</h3>
+                    <p className="text-muted-foreground mb-6">Buyer inquiries will appear here</p>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {inquiries.map((inquiry) => (
+                      <Card key={inquiry.id} className="bg-muted/30">
+                        <CardContent className="pt-4 sm:pt-6">
+                          <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 sm:gap-4 mb-4">
+                            <div className="flex-1">
+                              <div className="flex flex-wrap items-center gap-2 mb-1">
+                                <h4 className="font-semibold">{inquiry.buyer_name}</h4>
+                                <Badge variant={inquiry.status === "new" ? "default" : "secondary"}>
+                                  {inquiry.status === "new" ? (
+                                    <>
+                                      <AlertCircle className="h-3 w-3 mr-1" />
+                                      New
+                                    </>
+                                  ) : (
+                                    <>
+                                      <CheckCircle2 className="h-3 w-3 mr-1" />
+                                      Responded
+                                    </>
+                                  )}
+                                </Badge>
+                              </div>
+                              <p className="text-sm text-muted-foreground">{inquiry.project_name}</p>
+                            </div>
+                            <div className="text-left sm:text-right text-sm text-muted-foreground">
+                              <Clock className="h-4 w-4 inline mr-1" />
+                              {new Date(inquiry.created_at).toLocaleDateString()}
+                            </div>
+                          </div>
+
+                          <div className="space-y-3">
+                            <div className="bg-background rounded-lg p-3">
+                              <p className="text-sm">{inquiry.message}</p>
+                            </div>
+
+                            <div className="flex flex-col gap-3 text-sm">
+                              <div className="flex items-start gap-2 p-2 bg-muted/30 rounded">
+                                <MessageSquare className="h-4 w-4 text-primary mt-0.5 flex-shrink-0" />
+                                <a href={`mailto:${inquiry.buyer_email}`} className="text-primary hover:underline break-all flex-1">
+                                  {inquiry.buyer_email}
+                                </a>
+                              </div>
+                              {inquiry.buyer_phone && (
+                                <div className="flex items-center gap-2 p-2 bg-muted/30 rounded">
+                                  <Users className="h-4 w-4 text-primary flex-shrink-0" />
+                                  <a href={`tel:${inquiry.buyer_phone}`} className="text-primary hover:underline">
+                                    {inquiry.buyer_phone}
+                                  </a>
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="flex flex-col sm:flex-row gap-2">
+                              <Button size="default" variant="default" className="w-full sm:w-auto min-h-[44px]">
+                                <MessageSquare className="h-4 w-4 mr-2" />
+                                Respond
+                              </Button>
+                              <Button size="default" variant="outline" className="w-full sm:w-auto min-h-[44px]">
+                                Mark as Read
+                              </Button>
+                            </div>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="analytics" className="mt-6">
+            <div className="space-y-6">
+              <Card>
+                <CardHeader>
+                  <CardTitle>Performance Overview</CardTitle>
+                  <CardDescription>Track engagement and conversion metrics across your projects</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 sm:gap-6">
+                    <div className="space-y-2 p-4 bg-muted/30 rounded-lg">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-muted-foreground">Total Views</span>
+                        <Eye className="h-4 w-4 text-primary" />
+                      </div>
+                      <p className="text-2xl sm:text-3xl font-bold">{totalViews}</p>
+                      <Progress value={75} className="h-2" />
+                      <p className="text-xs text-success">↑ 12% from last month</p>
+                    </div>
+
+                    <div className="space-y-2 p-4 bg-muted/30 rounded-lg">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-muted-foreground">Interested Buyers</span>
+                        <Users className="h-4 w-4 text-primary" />
+                      </div>
+                      <p className="text-2xl sm:text-3xl font-bold">{totalInterested}</p>
+                      <Progress value={60} className="h-2" />
+                      <p className="text-xs text-success">↑ 8% from last month</p>
+                    </div>
+
+                    <div className="space-y-2 p-4 bg-muted/30 rounded-lg sm:col-span-2 md:col-span-1">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-muted-foreground">Conversion Rate</span>
+                        <TrendingUp className="h-4 w-4 text-primary" />
+                      </div>
+                      <p className="text-2xl sm:text-3xl font-bold">{conversionRate}%</p>
+                      <Progress value={parseFloat(conversionRate)} className="h-2" />
+                      <p className="text-xs text-success">↑ 3% from last month</p>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Project Performance</CardTitle>
+                  <CardDescription>Compare engagement across your projects</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {projects.length === 0 ? (
+                    <div className="text-center py-8">
+                      <BarChart3 className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
+                      <p className="text-muted-foreground">No projects to analyze yet</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      {projects.map((project) => {
+                        const projectConversion = project.views_count > 0
+                          ? ((project.interested_count / project.views_count) * 100).toFixed(1)
+                          : "0";
+
+                        return (
+                          <div key={project.id} className="p-3 sm:p-4 bg-muted/30 rounded-lg">
+                            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
+                              <div className="flex-1">
+                                <h4 className="font-semibold">{project.name}</h4>
+                                <p className="text-sm text-muted-foreground">{project.city}</p>
+                              </div>
+                              <Link to={`/projects/${project.id}`}>
+                                <Button variant="outline" size="default" className="w-full sm:w-auto min-h-[44px]">
+                                  <Eye className="h-4 w-4 mr-2" />
+                                  View Details
+                                </Button>
+                              </Link>
+                            </div>
+
+                            <div className="grid grid-cols-3 gap-3 sm:gap-4 mb-3">
+                              <div className="p-2 sm:p-3 bg-background rounded">
+                                <p className="text-xs text-muted-foreground mb-1">Views</p>
+                                <p className="text-lg sm:text-xl font-bold">{project.views_count}</p>
+                              </div>
+                              <div className="p-2 sm:p-3 bg-background rounded">
+                                <p className="text-xs text-muted-foreground mb-1">Interested</p>
+                                <p className="text-lg sm:text-xl font-bold">{project.interested_count}</p>
+                              </div>
+                              <div className="p-2 sm:p-3 bg-background rounded">
+                                <p className="text-xs text-muted-foreground mb-1">Conversion</p>
+                                <p className="text-lg sm:text-xl font-bold text-primary">{projectConversion}%</p>
+                              </div>
+                            </div>
+
+                            <div className="space-y-2">
+                              <div className="flex items-center justify-between text-xs">
+                                <span>Engagement Score</span>
+                                <span className="font-medium">{projectConversion}%</span>
+                              </div>
+                              <Progress value={parseFloat(projectConversion)} className="h-2" />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Insights & Recommendations</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="space-y-3">
+                    <div className="flex items-start gap-3 p-3 bg-info/10 rounded-lg border border-info/30">
+                      <TrendingUp className="h-5 w-5 text-info mt-0.5" />
+                      <div className="flex-1">
+                        <h5 className="font-semibold text-sm mb-1">Increase Visibility</h5>
+                        <p className="text-sm text-muted-foreground">
+                          Projects with regular construction updates get 40% more views. Upload progress photos weekly.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-start gap-3 p-3 bg-success/10 rounded-lg border border-success/30">
+                      <CheckCircle2 className="h-5 w-5 text-success mt-0.5" />
+                      <div className="flex-1">
+                        <h5 className="font-semibold text-sm mb-1">Great Response Rate</h5>
+                        <p className="text-sm text-muted-foreground">
+                          Your average response time to inquiries is excellent. Keep it up!
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-start gap-3 p-3 bg-warning/10 rounded-lg border border-warning/30">
+                      <AlertCircle className="h-5 w-5 text-warning mt-0.5" />
+                      <div className="flex-1">
+                        <h5 className="font-semibold text-sm mb-1">Enhance Project Details</h5>
+                        <p className="text-sm text-muted-foreground">
+                          Add high-quality images and detailed amenities to improve conversion rates.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
+        </Tabs>
+      </div>
+
+      <CreateProjectDialog
+        open={createDialogOpen}
+        onOpenChange={setCreateDialogOpen}
+        onSuccess={loadProjects}
+      />
+    </div>
+  );
+}
+

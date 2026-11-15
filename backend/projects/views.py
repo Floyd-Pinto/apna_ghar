@@ -1,0 +1,1405 @@
+from rest_framework import viewsets, filters, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticatedOrReadOnly, IsAuthenticated
+from rest_framework.exceptions import PermissionDenied
+from django_filters.rest_framework import DjangoFilterBackend
+from django.db.models import Q, Avg
+from .models import Developer, Project, Property, ConstructionMilestone, Review, ConstructionUpdate, Booking
+from .serializers import (
+    DeveloperSerializer, ProjectListSerializer, ProjectDetailSerializer,
+    ProjectCreateUpdateSerializer, PropertySerializer, MilestoneSerializer,
+    ReviewSerializer, ConstructionUpdateSerializer, BookingSerializer, BookingCreateSerializer
+)
+from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
+from .access import can_view_unit_private, get_developer, is_admin, manages_project
+from .permissions import (
+    IsAdmin, IsAuthorOrReadOnly, IsBuilderOrReadOnly, IsDeveloperOwnerOrReadOnly,
+    IsProjectManagerOrReadOnly, PropertyAccess,
+)
+from .media_storage import upload_media
+from .capture_verification import CaptureRejected, verify_capture
+import hashlib
+import io
+import json
+from django.utils import timezone
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class DeveloperViewSet(viewsets.ModelViewSet):
+    """ViewSet for Developer management"""
+    queryset = Developer.objects.all()
+    serializer_class = DeveloperSerializer
+    permission_classes = [IsDeveloperOwnerOrReadOnly]
+
+    def perform_create(self, serializer):
+        # A builder can only create their own developer profile
+        if not is_admin(self.request.user) and get_developer(self.request.user):
+            raise DRFPermissionDenied('You already have a developer profile.')
+        serializer.save(user=self.request.user)
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['company_name', 'rera_number']
+    ordering_fields = ['trust_score', 'total_projects', 'created_at']
+    ordering = ['-trust_score']
+    
+    @action(detail=True, methods=['get'])
+    def projects(self, request, pk=None):
+        """Get all projects by a developer"""
+        developer = self.get_object()
+        projects = developer.projects.all()
+        serializer = ProjectListSerializer(projects, many=True)
+        return Response(serializer.data)
+
+
+class ProjectViewSet(viewsets.ModelViewSet):
+    """ViewSet for Project management"""
+    queryset = Project.objects.select_related('developer').prefetch_related('milestones', 'properties', 'reviews')
+    permission_classes = [IsProjectManagerOrReadOnly]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ['status', 'project_type', 'city', 'developer', 'verified']
+    search_fields = ['name', 'description', 'city', 'address']
+    ordering_fields = ['starting_price', 'created_at', 'expected_completion', 'verification_score', 'views_count']
+    ordering = ['-created_at']
+    
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return ProjectListSerializer
+        elif self.action in ['create', 'update', 'partial_update']:
+            return ProjectCreateUpdateSerializer
+        return ProjectDetailSerializer
+    
+    def get_queryset(self):
+        from django.db.models import Avg, Count
+        queryset = super().get_queryset()
+        
+        try:
+            # Annotate with average rating and review count for ordering
+            queryset = queryset.annotate(
+                avg_rating=Avg('reviews__rating'),
+                review_count=Count('reviews')
+            )
+        except Exception as e:
+            # If annotation fails, just use base queryset
+            import logging
+            logging.warning(f"Failed to annotate project queryset: {e}")
+        
+        # Filter by price range
+        min_price = self.request.query_params.get('min_price')
+        max_price = self.request.query_params.get('max_price')
+        if min_price:
+            queryset = queryset.filter(starting_price__gte=min_price)
+        if max_price:
+            queryset = queryset.filter(starting_price__lte=max_price)
+        
+        # Filter by property types (comma-separated)
+        property_types = self.request.query_params.get('property_types')
+        if property_types:
+            types_list = property_types.split(',')
+            queryset = queryset.filter(properties__property_type__in=types_list).distinct()
+        
+        # Handle custom ordering by average rating (for "popular" filter)
+        ordering = self.request.query_params.get('ordering', '')
+        if ordering == 'popular' or ordering == '-popular':
+            # Order by highest average rating first, then by review count
+            try:
+                queryset = queryset.order_by('-avg_rating', '-review_count', '-views_count')
+            except Exception:
+                # Fallback to views_count if annotation failed
+                queryset = queryset.order_by('-views_count')
+        
+        return queryset
+    
+    def retrieve(self, request, *args, **kwargs):
+        """Override retrieve to increment views count"""
+        instance = self.get_object()
+        instance.views_count += 1
+        instance.save(update_fields=['views_count'])
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
+    
+    def perform_create(self, serializer):
+        """Set developer to current user's developer profile"""
+        developer = get_developer(self.request.user)
+        if developer is None:
+            raise DRFPermissionDenied('Only builders with a developer profile can create projects.')
+        project = serializer.save(developer=developer)
+        
+        # Store project creation on blockchain
+        try:
+            from blockchain.blockchain_service import get_blockchain_service
+            blockchain_service = get_blockchain_service()
+            blockchain_service.store_property_creation_on_blockchain(
+                property_id=str(project.id),
+                project_id=str(project.id),
+                unit_number='project',
+                property_data={
+                    'name': project.name,
+                    'slug': project.slug,
+                    'description': project.description,
+                    'project_type': project.project_type,
+                    'status': project.status,
+                    'city': project.city,
+                    'state': project.state,
+                    'starting_price': str(project.starting_price),
+                    'total_units': project.total_units,
+                },
+                created_by=str(self.request.user.id)
+            )
+            logger.info(f"Project creation stored on blockchain: {project.id}")
+        except Exception as e:
+            logger.warning(f"Blockchain storage failed (non-critical): {str(e)}")
+    
+    @action(detail=True, methods=['get'])
+    def milestones(self, request, pk=None):
+        """Get construction milestones for a project"""
+        project = self.get_object()
+        # Visibility: developer OR any authenticated buyer OR builders
+        user = request.user
+        allowed = False
+        if user and user.is_authenticated:
+            # Check if user is a builder (by role)
+            if hasattr(user, 'role') and user.role == 'builder':
+                allowed = True
+            
+            # Check if user is the developer of this project
+            if not allowed:
+                try:
+                    developer = Developer.objects.get(user=user)
+                    if project.developer == developer:
+                        allowed = True
+                except Developer.DoesNotExist:
+                    pass
+
+            # Any authenticated buyer (role='buyer') can view project milestones
+            if not allowed and hasattr(user, 'role') and user.role == 'buyer':
+                allowed = True
+
+            # Buyer of any unit in project (fallback)
+            if not allowed:
+                if project.properties.filter(buyer=user).exists():
+                    allowed = True
+
+        if not allowed:
+            return Response({'detail': 'You do not have permission to view milestones for this project.'}, status=status.HTTP_403_FORBIDDEN)
+
+        milestones = project.milestones.all()
+        serializer = MilestoneSerializer(milestones, many=True, context={'request': request})
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'])
+    def properties(self, request, pk=None):
+        """Get properties for a project"""
+        project = self.get_object()
+        # Similar permission logic as milestones
+        user = request.user
+        allowed = False
+        if user and user.is_authenticated:
+            # Check if user is a builder (by role)
+            if hasattr(user, 'role') and user.role == 'builder':
+                allowed = True
+            
+            # Check if user is the developer of this project
+            if not allowed:
+                try:
+                    developer = Developer.objects.get(user=user)
+                    if project.developer == developer:
+                        allowed = True
+                except Developer.DoesNotExist:
+                    pass
+
+            # Any authenticated buyer (role='buyer') can view project properties
+            if not allowed and hasattr(user, 'role') and user.role == 'buyer':
+                allowed = True
+
+            # Buyer of any unit in project (fallback)
+            if not allowed:
+                if project.properties.filter(buyer=user).exists():
+                    allowed = True
+
+        if not allowed:
+            return Response({'detail': 'You do not have permission to view properties for this project.'}, status=status.HTTP_403_FORBIDDEN)
+
+        properties = project.properties.all()
+        serializer = PropertySerializer(properties, many=True, context={'request': request})
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def mark_interested(self, request, pk=None):
+        """Mark user as interested in project"""
+        project = self.get_object()
+        project.interested_count += 1
+        project.save(update_fields=['interested_count'])
+        return Response({'status': 'interest recorded', 'count': project.interested_count})
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_projects(self, request):
+        """Get projects belonging to the logged-in builder/developer"""
+        try:
+            developer = Developer.objects.get(user=request.user)
+        except Developer.DoesNotExist:
+            return Response({'detail': 'Only builders can access this endpoint.'}, status=status.HTTP_403_FORBIDDEN)
+        
+        # Get projects for this developer with optimized query
+        # Use select_related and prefetch_related to avoid N+1 queries
+        queryset = Project.objects.select_related(
+            'developer'
+        ).prefetch_related(
+            'milestones', 
+            'properties',
+            'reviews'
+        ).filter(developer=developer)
+        
+        # Apply pagination
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = ProjectListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = ProjectListSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+
+class PropertyViewSet(viewsets.ModelViewSet):
+    """ViewSet for Property units with privacy controls"""
+    queryset = Property.objects.select_related('project', 'project__developer', 'buyer')
+    serializer_class = PropertySerializer
+    permission_classes = [PropertyAccess]
+
+    def perform_create(self, serializer):
+        project = serializer.validated_data.get('project')
+        if not manages_project(self.request.user, project):
+            raise DRFPermissionDenied('You can only add units to your own projects.')
+        serializer.save()
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ['project', 'property_type', 'status', 'floor_number']
+    ordering_fields = ['price', 'carpet_area', 'floor_number']
+    ordering = ['floor_number', 'unit_number']
+    
+    def retrieve(self, request, *args, **kwargs):
+        """Override retrieve to check permissions for sold properties"""
+        instance = self.get_object()
+        
+        # Check permission
+        self.check_object_permissions(request, instance)
+        
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsBuilderOrReadOnly])
+    def upload_media(self, request, pk=None):
+        """Upload photos/videos for a specific unit/property. Only builder (developer) may upload.
+
+        Expected multipart/form-data with files under 'images' and/or 'videos'. Optional fields: 'description', 'progress_percentage'.
+        """
+        prop = self.get_object()
+
+        # Ensure requester is the developer of the project
+        try:
+            developer = Developer.objects.get(user=request.user)
+        except Developer.DoesNotExist:
+            return Response({'detail': 'Only builders can upload media.'}, status=status.HTTP_403_FORBIDDEN)
+
+        if prop.project.developer != developer:
+            return Response({'detail': 'You are not the developer for this project.'}, status=status.HTTP_403_FORBIDDEN)
+
+        images = request.FILES.getlist('images')
+        videos = request.FILES.getlist('videos')
+        description = request.data.get('description')
+        progress_percentage = request.data.get('progress_percentage')
+
+        uploaded_images = []
+        uploaded_videos = []
+
+        # Upload images
+        for img in images:
+            try:
+                # Read bytes to compute SHA256 and upload
+                img_bytes = img.read()
+                sha256 = hashlib.sha256(img_bytes).hexdigest()
+                
+                # Check if resource already exists in Cloudinary (dedupe)
+                # Use full path with folder for the public_id
+                public_id = f"estate_platform/units/{sha256}"
+                # Cloudinary when configured, local MEDIA_ROOT otherwise
+                cloudinary_url = upload_media(img_bytes, public_id, 'image', img)
+                
+                entry = {
+                    'url': cloudinary_url,
+                    'sha256': sha256,
+                    'uploaded_at': timezone.now().isoformat(),
+                    'description': description or ''
+                }
+                prop.unit_photos.append(entry)
+                uploaded_images.append(entry)
+            except Exception as e:
+                return Response({'detail': f'Image upload failed: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Upload videos
+        for vid in videos:
+            try:
+                vid_bytes = vid.read()
+                sha256 = hashlib.sha256(vid_bytes).hexdigest()
+                
+                # Check if resource already exists in Cloudinary (dedupe)
+                # Use full path with folder for the public_id
+                public_id = f"estate_platform/units/{sha256}"
+                # Cloudinary when configured, local MEDIA_ROOT otherwise
+                cloudinary_url = upload_media(vid_bytes, public_id, 'video', vid)
+                
+                entry = {
+                    'url': cloudinary_url,
+                    'sha256': sha256,
+                    'uploaded_at': timezone.now().isoformat(),
+                    'description': description or ''
+                }
+                prop.unit_videos.append(entry)
+                uploaded_videos.append(entry)
+            except Exception as e:
+                return Response({'detail': f'Video upload failed: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Optionally update progress percentage
+        if progress_percentage is not None:
+            try:
+                p = int(progress_percentage)
+                prop.unit_progress_percentage = max(0, min(100, p))
+            except ValueError:
+                pass
+
+        # Optionally add a progress update entry
+        if description:
+            update_entry = {
+                'phase': request.data.get('phase', ''),
+                'description': description,
+                'date': timezone.now().isoformat(),
+                'progress': prop.unit_progress_percentage
+            }
+            prop.unit_progress_updates.append(update_entry)
+
+        prop.save()
+
+        return Response({
+            'images': uploaded_images,
+            'videos': uploaded_videos,
+            'unit_progress_percentage': prop.unit_progress_percentage,
+            'unit_progress_updates': prop.unit_progress_updates
+        })
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def progress(self, request, pk=None):
+        """Return unit progress (photos/videos/updates). Only visible to buyer of unit or developer."""
+        prop = self.get_object()
+        user = request.user
+
+        allowed = can_view_unit_private(user, prop)  # buyer, the project's builder, or an admin
+
+        if not allowed:
+            return Response({'detail': 'You do not have permission to view this unit progress.'}, status=status.HTTP_403_FORBIDDEN)
+
+        from .serializers import UnitProgressSerializer
+        serializer = UnitProgressSerializer(prop, context={'request': request})
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def secure_upload(self, request, pk=None):
+        """Secure upload endpoint for property units - requires QR verification token and camera capture"""
+        try:
+            prop = self.get_object()
+            
+            # Verify upload token
+            upload_token = request.data.get('upload_token')
+            if not upload_token or upload_token != prop.qr_code_secret[:32]:
+                return Response({'detail': 'Invalid upload token'}, status=status.HTTP_403_FORBIDDEN)
+            
+            # Check if request is from mobile device
+            user_agent = request.META.get('HTTP_USER_AGENT', '').lower()
+            is_mobile = any(device in user_agent for device in ['mobile', 'android', 'iphone', 'ipad', 'tablet'])
+            
+            # Parse device_info - handle both JSON string and dict
+            device_info_raw = request.data.get('device_info', {})
+            if isinstance(device_info_raw, str):
+                try:
+                    device_info = json.loads(device_info_raw)
+                except (json.JSONDecodeError, TypeError):
+                    device_info = {}
+            else:
+                device_info = device_info_raw or {}
+            
+            if not is_mobile and not device_info.get('is_mobile', False):
+                return Response({
+                    'detail': 'Upload is only allowed from mobile devices.',
+                    'error_code': 'DESKTOP_UPLOAD_BLOCKED'
+                }, status=status.HTTP_403_FORBIDDEN)
+            
+            # Verify camera capture metadata - handle both JSON string and dict
+            capture_metadata_raw = request.data.get('capture_metadata', {})
+            if isinstance(capture_metadata_raw, str):
+                try:
+                    capture_metadata = json.loads(capture_metadata_raw)
+                except (json.JSONDecodeError, TypeError):
+                    capture_metadata = {}
+            else:
+                capture_metadata = capture_metadata_raw or {}
+            
+            if not capture_metadata.get('camera_captured', False):
+                return Response({
+                    'detail': 'Only camera-captured media is allowed. Gallery uploads are blocked.',
+                    'error_code': 'GALLERY_UPLOAD_BLOCKED'
+                }, status=status.HTTP_403_FORBIDDEN)
+            
+            # Verify developer
+            developer = Developer.objects.get(user=request.user)
+            if prop.project.developer != developer:
+                return Response({
+                    'detail': 'You are not the developer for this project.'
+                }, status=status.HTTP_403_FORBIDDEN)
+            
+            # Process images and videos
+            # Proof it was shot on site, just now: GPS fix + fresh capture times (see capture_verification.py)
+            try:
+                capture_verification = verify_capture(
+                    capture_metadata, request.FILES.getlist('images'), request.FILES.getlist('videos'), prop.project)
+            except CaptureRejected as rejected:
+                return Response({'detail': str(rejected), 'error_code': rejected.code}, status=status.HTTP_400_BAD_REQUEST)
+            capture_metadata = {**capture_metadata, 'verification': capture_verification}
+
+            images = request.FILES.getlist('images')
+            videos = request.FILES.getlist('videos')
+            description = request.data.get('description', '')
+            progress_percentage = request.data.get('progress_percentage')
+            
+            # Check limits
+            if len(images) > 15:
+                return Response({'detail': 'Maximum 15 images allowed per upload'}, status=status.HTTP_400_BAD_REQUEST)
+            if len(videos) > 5:
+                return Response({'detail': 'Maximum 5 videos allowed per upload'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            logger.info(f"Secure property upload - Unit: {prop.unit_number}, Images: {len(images)}, Videos: {len(videos)}")
+            
+            uploaded_images = []
+            uploaded_videos = []
+            
+            # Upload images with metadata
+            for img in images:
+                try:
+                    if img.size > 10 * 1024 * 1024:  # 10MB
+                        return Response({'detail': f'Image {img.name} exceeds 10MB limit'}, status=status.HTTP_400_BAD_REQUEST)
+                    
+                    img_bytes = img.read()
+                    sha256 = hashlib.sha256(img_bytes).hexdigest()
+                    
+                    public_id = f"estate_platform/units/{sha256}"
+                    # Cloudinary when configured, local MEDIA_ROOT otherwise
+                    cloudinary_url = upload_media(img_bytes, public_id, 'image', img)
+                    
+                    entry = {
+                        'url': cloudinary_url,
+                        'sha256': sha256,
+                        'uploaded_at': timezone.now().isoformat(),
+                        'description': description,
+                        'capture_metadata': capture_metadata,
+                        'device_info': device_info,
+                        'verified_upload': True,
+                        'qr_verified': True
+                    }
+                    prop.unit_photos.append(entry)
+                    uploaded_images.append(entry)
+                    
+                except Exception as e:
+                    logger.error(f"Secure property image upload failed: {str(e)}", exc_info=True)
+                    return Response({'detail': f'Image upload failed: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Upload videos with metadata
+            for vid in videos:
+                try:
+                    if vid.size > 50 * 1024 * 1024:  # 50MB
+                        return Response({'detail': f'Video {vid.name} exceeds 50MB limit'}, status=status.HTTP_400_BAD_REQUEST)
+                    
+                    vid_bytes = vid.read()
+                    sha256 = hashlib.sha256(vid_bytes).hexdigest()
+                    
+                    public_id = f"estate_platform/units/{sha256}"
+                    # Cloudinary when configured, local MEDIA_ROOT otherwise
+                    cloudinary_url = upload_media(vid_bytes, public_id, 'video', vid)
+                    
+                    entry = {
+                        'url': cloudinary_url,
+                        'sha256': sha256,
+                        'uploaded_at': timezone.now().isoformat(),
+                        'description': description,
+                        'capture_metadata': capture_metadata,
+                        'device_info': device_info,
+                        'verified_upload': True,
+                        'qr_verified': True
+                    }
+                    prop.unit_videos.append(entry)
+                    uploaded_videos.append(entry)
+                    
+                except Exception as e:
+                    logger.error(f"Secure property video upload failed: {str(e)}", exc_info=True)
+                    return Response({'detail': f'Video upload failed: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Update progress if provided
+            if progress_percentage is not None:
+                try:
+                    p = int(progress_percentage)
+                    prop.unit_progress_percentage = max(0, min(100, p))
+                except ValueError:
+                    pass
+            
+            # Add progress update entry
+            if description:
+                update_entry = {
+                    'phase': request.data.get('phase', ''),
+                    'description': description,
+                    'date': timezone.now().isoformat(),
+                    'progress': prop.unit_progress_percentage,
+                    'verified_upload': True,
+                    'qr_verified': True
+                }
+                prop.unit_progress_updates.append(update_entry)
+            
+            # Save property with updated media
+            prop.save()
+            
+            # Create ConstructionUpdate record for property-specific update
+            try:
+                from datetime import date
+                ConstructionUpdate.objects.create(
+                    project=prop.project,
+                    created_by=request.user,
+                    update_type='property_specific',
+                    title=f"Progress Update - Unit {prop.unit_number}",
+                    description=description or f"Construction progress update for Unit {prop.unit_number}",
+                    update_date=date.today(),
+                    images=[{'url': img['url'], 'caption': img.get('description', '')} for img in uploaded_images],
+                    videos=[{'url': vid['url'], 'caption': vid.get('description', '')} for vid in uploaded_videos],
+                    property_unit_number=prop.unit_number,
+                    visible_to_owner_only=True,
+                    completion_percentage=prop.unit_progress_percentage
+                )
+                logger.info(f"ConstructionUpdate created for property: {prop.id}")
+            except Exception as e:
+                logger.error(f"Failed to create ConstructionUpdate: {str(e)}", exc_info=True)
+                # Don't fail the upload if ConstructionUpdate creation fails
+            
+            # Store on blockchain (images/videos are on Cloudinary, store hash on blockchain)
+            try:
+                from blockchain.blockchain_service import get_blockchain_service
+                blockchain_service = get_blockchain_service()
+                
+                # Extract Cloudinary URLs
+                cloudinary_urls = [img['url'] for img in uploaded_images] + [vid['url'] for vid in uploaded_videos]
+                
+                blockchain_service.store_progress_update_on_blockchain(
+                    project_id=str(prop.project.id),
+                    property_id=str(prop.id),
+                    milestone_id=None,
+                    description=description or f"Construction progress update for Unit {prop.unit_number}",
+                    cloudinary_urls=cloudinary_urls,
+                    uploaded_by=str(request.user.id),
+                    metadata={
+                        'unit_number': prop.unit_number,
+                        'progress_percentage': prop.unit_progress_percentage,
+                        'update_type': 'property_specific'
+                    }
+                )
+                logger.info(f"Progress update stored on blockchain for property: {prop.id}")
+            except Exception as e:
+                logger.warning(f"Blockchain storage failed (non-critical): {str(e)}")
+                # Don't fail the upload if blockchain storage fails
+            
+            logger.info(f"Secure property upload completed - Unit: {prop.unit_number}")
+            
+            return Response({
+                'success': True,
+                'unit_number': prop.unit_number,
+                'uploaded_images': len(uploaded_images),
+                'uploaded_videos': len(uploaded_videos),
+                'unit_progress_percentage': prop.unit_progress_percentage,
+                'message': 'Media uploaded successfully with QR verification'
+            })
+            
+        except Developer.DoesNotExist:
+            return Response({'detail': 'Only builders can upload media'}, status=status.HTTP_403_FORBIDDEN)
+        except Exception as e:
+            logger.error(f"Secure property upload error: {str(e)}", exc_info=True)
+            return Response({'detail': f'Internal server error: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class MilestoneViewSet(viewsets.ModelViewSet):
+    """ViewSet for Construction Milestones"""
+    queryset = ConstructionMilestone.objects.select_related('project__developer', 'verified_by')
+    serializer_class = MilestoneSerializer
+    permission_classes = [IsProjectManagerOrReadOnly]
+
+    def perform_create(self, serializer):
+        if not manages_project(self.request.user, serializer.validated_data.get('project')):
+            raise DRFPermissionDenied('You can only add milestones to your own projects.')
+        serializer.save()
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ['project', 'status', 'verified']
+    ordering_fields = ['phase_number', 'target_date', 'progress_percentage']
+    ordering = ['phase_number']
+
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def verify(self, request, pk=None):
+        """Verify a milestone. Admins only - a builder can't verify their own work."""
+        milestone = self.get_object()
+        milestone.verified = True
+        milestone.verified_by = request.user
+        from django.utils import timezone
+        milestone.verified_at = timezone.now()
+        milestone.save(update_fields=['verified', 'verified_by', 'verified_at'])
+        serializer = self.get_serializer(milestone)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def upload_media(self, request, pk=None):
+        """Upload images/videos against a specific milestone. Only builder (developer) may upload."""
+        try:
+            milestone = self.get_object()
+            
+            logger.info(f"Upload media request - User: {request.user.username}, Milestone ID: {milestone.id}")
+            logger.info(f"Milestone Project: {milestone.project.name}, Project Developer: {milestone.project.developer.company_name if milestone.project.developer else 'None'}")
+
+            # Ensure requester is the developer of the project
+            try:
+                developer = Developer.objects.get(user=request.user)
+                logger.info(f"Found developer: {developer.company_name}")
+            except Developer.DoesNotExist:
+                logger.error(f"User {request.user.username} does not have a Developer profile")
+                return Response({'detail': 'Only builders can upload media. Please ensure you are logged in as a builder.'}, status=status.HTTP_403_FORBIDDEN)
+
+            # Check if project has a developer assigned
+            if not hasattr(milestone.project, 'developer') or milestone.project.developer is None:
+                logger.error(f"Project {milestone.project.name} has no developer assigned")
+                return Response({'detail': 'This project has no developer assigned.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if milestone.project.developer != developer:
+                logger.error(f"Developer mismatch - Request from: {developer.company_name}, Project owner: {milestone.project.developer.company_name}")
+                return Response({
+                    'detail': f'You are not the developer for this project. This project belongs to {milestone.project.developer.company_name}.'
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            images = request.FILES.getlist('images')
+            videos = request.FILES.getlist('videos')
+            description = request.data.get('description', '')
+
+            logger.info(f"Upload request from {request.user.email}: {len(images)} images, {len(videos)} videos")
+
+            uploaded_images = []
+            uploaded_videos = []
+
+            # Upload images
+            for img in images:
+                try:
+                    # Read bytes to compute SHA256 and upload
+                    img_bytes = img.read()
+                    sha256 = hashlib.sha256(img_bytes).hexdigest()
+                    
+                    logger.info(f"Processing image: {img.name}, SHA256: {sha256}")
+                    
+                    # Check if resource already exists in Cloudinary (dedupe)
+                    # Use full path with folder for the public_id
+                    public_id = f"estate_platform/milestones/{sha256}"
+                    # Cloudinary when configured, local MEDIA_ROOT otherwise
+                    cloudinary_url = upload_media(img_bytes, public_id, 'image', img)
+                    
+                    entry = {
+                        'url': cloudinary_url,
+                        'sha256': sha256,
+                        'uploaded_at': timezone.now().isoformat(),
+                        'description': description
+                    }
+                    uploaded_images.append(entry)
+                except Exception as e:
+                    logger.error(f"Image upload failed: {str(e)}", exc_info=True)
+                    return Response({'detail': f'Image upload failed: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Upload videos
+            for vid in videos:
+                try:
+                    vid_bytes = vid.read()
+                    sha256 = hashlib.sha256(vid_bytes).hexdigest()
+                    
+                    logger.info(f"Processing video: {vid.name}, SHA256: {sha256}")
+                    
+                    # Check if resource already exists in Cloudinary (dedupe)
+                    # Use full path with folder for the public_id
+                    public_id = f"estate_platform/milestones/{sha256}"
+                    # Cloudinary when configured, local MEDIA_ROOT otherwise
+                    cloudinary_url = upload_media(vid_bytes, public_id, 'video', vid)
+                    
+                    entry = {
+                        'url': cloudinary_url,
+                        'sha256': sha256,
+                        'uploaded_at': timezone.now().isoformat(),
+                        'description': description
+                    }
+                    uploaded_videos.append(entry)
+                except Exception as e:
+                    logger.error(f"Video upload failed: {str(e)}", exc_info=True)
+                    return Response({'detail': f'Video upload failed: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Update milestone with new media (create new list to trigger JSONField update)
+            milestone.images = list(milestone.images or []) + uploaded_images
+            milestone.videos = list(milestone.videos or []) + uploaded_videos
+            milestone.save()
+
+            logger.info(f"Milestone updated successfully: {milestone.id}")
+            
+            # Store on blockchain (images/videos are on Cloudinary, store hash on blockchain)
+            try:
+                from blockchain.blockchain_service import get_blockchain_service
+                blockchain_service = get_blockchain_service()
+                
+                # Extract Cloudinary URLs
+                cloudinary_urls = [img['url'] for img in uploaded_images] + [vid['url'] for vid in uploaded_videos]
+                
+                blockchain_service.store_progress_update_on_blockchain(
+                    project_id=str(milestone.project.id),
+                    property_id=None,
+                    milestone_id=str(milestone.id),
+                    description=description or f"Construction progress update for {milestone.title}",
+                    cloudinary_urls=cloudinary_urls,
+                    uploaded_by=str(request.user.id),
+                    metadata={
+                        'milestone_title': milestone.title,
+                        'phase_number': milestone.phase_number,
+                        'progress_percentage': float(milestone.progress_percentage),
+                        'update_type': 'project_level'
+                    }
+                )
+                logger.info(f"Progress update stored on blockchain for milestone: {milestone.id}")
+            except Exception as e:
+                logger.warning(f"Blockchain storage failed (non-critical): {str(e)}")
+                # Don't fail the upload if blockchain storage fails
+
+            serializer = self.get_serializer(milestone)
+            return Response({
+                'milestone': serializer.data, 
+                'uploaded_images': uploaded_images, 
+                'uploaded_videos': uploaded_videos
+            })
+        
+        except Exception as e:
+            logger.error(f"Upload media error: {str(e)}", exc_info=True)
+            return Response({'detail': f'Internal server error: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
+    def verify_qr(self, request):
+        """Verify QR code and return milestone/property details for secure upload"""
+        try:
+            qr_data = request.data.get('qr_data')
+            device_info = request.data.get('device_info', {})
+            
+            logger.info(f"QR verification request - QR Data: {qr_data}, User: {request.user.username}")
+            
+            # Check if request is from mobile device
+            user_agent = request.META.get('HTTP_USER_AGENT', '').lower()
+            is_mobile = any(device in user_agent for device in ['mobile', 'android', 'iphone', 'ipad', 'tablet'])
+            
+            if not is_mobile and not device_info.get('is_mobile', False):
+                return Response({
+                    'detail': 'Upload is only allowed from mobile devices.',
+                    'error_code': 'DESKTOP_UPLOAD_BLOCKED'
+                }, status=status.HTTP_403_FORBIDDEN)
+            
+            if not qr_data:
+                return Response({'detail': 'QR code data is required'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Parse QR data (format: "milestone:<project_id>:<milestone_id>:<token>")
+            try:
+                parts = qr_data.split(':')
+                if len(parts) < 4:
+                    return Response({'detail': 'Invalid QR code format'}, status=status.HTTP_400_BAD_REQUEST)
+                
+                entity_type = parts[0]  # 'milestone' or 'property'
+                project_id = parts[1]
+                entity_id = parts[2]
+                
+                if entity_type == 'milestone':
+                    milestone = ConstructionMilestone.objects.get(
+                        id=entity_id,
+                        project_id=project_id,
+                        qr_code_data=qr_data
+                    )
+                    
+                    # Verify developer
+                    developer = Developer.objects.get(user=request.user)
+                    if milestone.project.developer != developer:
+                        return Response({
+                            'detail': 'You are not authorized to upload to this milestone.'
+                        }, status=status.HTTP_403_FORBIDDEN)
+                    
+                    return Response({
+                        'verified': True,
+                        'entity_type': 'milestone',
+                        'entity_id': str(milestone.id),
+                        'project_name': milestone.project.name,
+                        'title': milestone.title,
+                        'description': milestone.description,
+                        'phase_number': milestone.phase_number,
+                        'upload_token': milestone.qr_code_secret[:32],  # First 32 chars as upload token
+                        'upload_endpoint': f'/api/projects/milestones/{milestone.id}/secure_upload/',
+                        'restrictions': {
+                            'camera_only': True,
+                            'max_images': 10,
+                            'max_videos': 5,
+                            'max_image_size_mb': 10,
+                            'max_video_size_mb': 50
+                        }
+                    })
+                
+                elif entity_type == 'property':
+                    property_obj = Property.objects.get(
+                        id=entity_id,
+                        project_id=project_id,
+                        qr_code_data=qr_data
+                    )
+                    
+                    # Verify developer
+                    developer = Developer.objects.get(user=request.user)
+                    if property_obj.project.developer != developer:
+                        return Response({
+                            'detail': 'You are not authorized to upload to this property.'
+                        }, status=status.HTTP_403_FORBIDDEN)
+                    
+                    return Response({
+                        'verified': True,
+                        'entity_type': 'property',
+                        'entity_id': str(property_obj.id),
+                        'project_name': property_obj.project.name,
+                        'unit_number': property_obj.unit_number,
+                        'property_type': property_obj.property_type,
+                        'upload_token': property_obj.qr_code_secret[:32],
+                        'upload_endpoint': f'/api/projects/properties/{property_obj.id}/secure_upload/',
+                        'restrictions': {
+                            'camera_only': True,
+                            'max_images': 15,
+                            'max_videos': 5,
+                            'max_image_size_mb': 10,
+                            'max_video_size_mb': 50
+                        }
+                    })
+                
+                else:
+                    return Response({'detail': 'Invalid entity type in QR code'}, status=status.HTTP_400_BAD_REQUEST)
+                    
+            except (ConstructionMilestone.DoesNotExist, Property.DoesNotExist):
+                return Response({'detail': 'Invalid QR code or entity not found'}, status=status.HTTP_404_NOT_FOUND)
+            except Developer.DoesNotExist:
+                return Response({'detail': 'Only builders can upload construction updates'}, status=status.HTTP_403_FORBIDDEN)
+            except Exception as e:
+                logger.error(f"QR verification error: {str(e)}", exc_info=True)
+                return Response({'detail': 'Invalid QR code data'}, status=status.HTTP_400_BAD_REQUEST)
+                
+        except Exception as e:
+            logger.error(f"QR verify error: {str(e)}", exc_info=True)
+            return Response({'detail': f'Internal server error: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def secure_upload(self, request, pk=None):
+        """Secure upload endpoint - requires QR verification token and camera capture metadata"""
+        try:
+            milestone = self.get_object()
+            
+            # Verify upload token
+            upload_token = request.data.get('upload_token')
+            if not upload_token or upload_token != milestone.qr_code_secret[:32]:
+                return Response({'detail': 'Invalid upload token'}, status=status.HTTP_403_FORBIDDEN)
+            
+            # Check if request is from mobile device
+            user_agent = request.META.get('HTTP_USER_AGENT', '').lower()
+            is_mobile = any(device in user_agent for device in ['mobile', 'android', 'iphone', 'ipad', 'tablet'])
+            
+            # Parse device_info - handle both JSON string and dict
+            device_info_raw = request.data.get('device_info', {})
+            if isinstance(device_info_raw, str):
+                try:
+                    device_info = json.loads(device_info_raw)
+                except (json.JSONDecodeError, TypeError):
+                    device_info = {}
+            else:
+                device_info = device_info_raw or {}
+            
+            if not is_mobile and not device_info.get('is_mobile', False):
+                return Response({
+                    'detail': 'Upload is only allowed from mobile devices.',
+                    'error_code': 'DESKTOP_UPLOAD_BLOCKED'
+                }, status=status.HTTP_403_FORBIDDEN)
+            
+            # Verify camera capture metadata - handle both JSON string and dict
+            capture_metadata_raw = request.data.get('capture_metadata', {})
+            if isinstance(capture_metadata_raw, str):
+                try:
+                    capture_metadata = json.loads(capture_metadata_raw)
+                except (json.JSONDecodeError, TypeError):
+                    capture_metadata = {}
+            else:
+                capture_metadata = capture_metadata_raw or {}
+            
+            if not capture_metadata.get('camera_captured', False):
+                return Response({
+                    'detail': 'Only camera-captured media is allowed. Gallery uploads are blocked.',
+                    'error_code': 'GALLERY_UPLOAD_BLOCKED'
+                }, status=status.HTTP_403_FORBIDDEN)
+            
+            # Verify developer
+            developer = Developer.objects.get(user=request.user)
+            if milestone.project.developer != developer:
+                return Response({
+                    'detail': 'You are not the developer for this project.'
+                }, status=status.HTTP_403_FORBIDDEN)
+            
+            # Process images and videos with metadata
+            # Proof it was shot on site, just now: GPS fix + fresh capture times (see capture_verification.py)
+            try:
+                capture_verification = verify_capture(
+                    capture_metadata, request.FILES.getlist('images'), request.FILES.getlist('videos'), milestone.project)
+            except CaptureRejected as rejected:
+                return Response({'detail': str(rejected), 'error_code': rejected.code}, status=status.HTTP_400_BAD_REQUEST)
+            capture_metadata = {**capture_metadata, 'verification': capture_verification}
+
+            images = request.FILES.getlist('images')
+            videos = request.FILES.getlist('videos')
+            description = request.data.get('description', '')
+            
+            # Check limits
+            if len(images) > 10:
+                return Response({'detail': 'Maximum 10 images allowed per upload'}, status=status.HTTP_400_BAD_REQUEST)
+            if len(videos) > 5:
+                return Response({'detail': 'Maximum 5 videos allowed per upload'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            logger.info(f"Secure upload - Milestone: {milestone.id}, Images: {len(images)}, Videos: {len(videos)}")
+            
+            uploaded_images = []
+            uploaded_videos = []
+            
+            # Upload images with enhanced metadata
+            for img in images:
+                try:
+                    # Check size
+                    if img.size > 10 * 1024 * 1024:  # 10MB
+                        return Response({'detail': f'Image {img.name} exceeds 10MB limit'}, status=status.HTTP_400_BAD_REQUEST)
+                    
+                    img_bytes = img.read()
+                    sha256 = hashlib.sha256(img_bytes).hexdigest()
+                    
+                    public_id = f"estate_platform/milestones/{sha256}"
+                    # Cloudinary when configured, local MEDIA_ROOT otherwise
+                    cloudinary_url = upload_media(img_bytes, public_id, 'image', img)
+                    
+                    entry = {
+                        'url': cloudinary_url,
+                        'sha256': sha256,
+                        'uploaded_at': timezone.now().isoformat(),
+                        'description': description,
+                        'capture_metadata': capture_metadata,
+                        'device_info': device_info,
+                        'verified_upload': True,
+                        'qr_verified': True
+                    }
+                    uploaded_images.append(entry)
+                    
+                except Exception as e:
+                    logger.error(f"Secure image upload failed: {str(e)}", exc_info=True)
+                    return Response({'detail': f'Image upload failed: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Upload videos with enhanced metadata
+            for vid in videos:
+                try:
+                    # Check size
+                    if vid.size > 50 * 1024 * 1024:  # 50MB
+                        return Response({'detail': f'Video {vid.name} exceeds 50MB limit'}, status=status.HTTP_400_BAD_REQUEST)
+                    
+                    vid_bytes = vid.read()
+                    sha256 = hashlib.sha256(vid_bytes).hexdigest()
+                    
+                    public_id = f"estate_platform/milestones/{sha256}"
+                    # Cloudinary when configured, local MEDIA_ROOT otherwise
+                    cloudinary_url = upload_media(vid_bytes, public_id, 'video', vid)
+                    
+                    entry = {
+                        'url': cloudinary_url,
+                        'sha256': sha256,
+                        'uploaded_at': timezone.now().isoformat(),
+                        'description': description,
+                        'capture_metadata': capture_metadata,
+                        'device_info': device_info,
+                        'verified_upload': True,
+                        'qr_verified': True
+                    }
+                    uploaded_videos.append(entry)
+                    
+                except Exception as e:
+                    logger.error(f"Secure video upload failed: {str(e)}", exc_info=True)
+                    return Response({'detail': f'Video upload failed: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Update milestone
+            milestone.images = list(milestone.images or []) + uploaded_images
+            milestone.videos = list(milestone.videos or []) + uploaded_videos
+            milestone.save()
+            
+            # Create ConstructionUpdate record with uploaded media
+            try:
+                from datetime import date
+                ConstructionUpdate.objects.create(
+                    project=milestone.project,
+                    created_by=request.user,
+                    update_type='project_level',
+                    title=f"Progress Update - {milestone.title}",
+                    description=description or f"Construction progress update for {milestone.title}",
+                    update_date=date.today(),
+                    images=[{'url': img['url'], 'caption': img.get('description', '')} for img in uploaded_images],
+                    videos=[{'url': vid['url'], 'caption': vid.get('description', '')} for vid in uploaded_videos],
+                    completion_percentage=milestone.progress_percentage,
+                    milestone_achieved=milestone.title
+                )
+                logger.info(f"ConstructionUpdate created for milestone: {milestone.id}")
+            except Exception as e:
+                logger.error(f"Failed to create ConstructionUpdate: {str(e)}", exc_info=True)
+                # Don't fail the upload if ConstructionUpdate creation fails
+            
+            logger.info(f"Secure upload completed - Milestone: {milestone.id}")
+            
+            serializer = self.get_serializer(milestone)
+            return Response({
+                'success': True,
+                'milestone': serializer.data,
+                'uploaded_images': len(uploaded_images),
+                'uploaded_videos': len(uploaded_videos),
+                'message': 'Media uploaded successfully with QR verification'
+            })
+            
+        except Developer.DoesNotExist:
+            return Response({'detail': 'Only builders can upload media'}, status=status.HTTP_403_FORBIDDEN)
+        except Exception as e:
+            logger.error(f"Secure upload error: {str(e)}", exc_info=True)
+            return Response({'detail': f'Internal server error: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class ReviewViewSet(viewsets.ModelViewSet):
+    """ViewSet for Project Reviews"""
+    queryset = Review.objects.select_related('project', 'user')
+    serializer_class = ReviewSerializer
+    permission_classes = [IsAuthorOrReadOnly]
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ['project', 'rating', 'verified_buyer']
+    ordering_fields = ['rating', 'helpful_count', 'created_at']
+    ordering = ['-created_at']
+    
+    def perform_create(self, serializer):
+        """Set user to current logged-in user"""
+        serializer.save(user=self.request.user)
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def mark_helpful(self, request, pk=None):
+        """Mark a review as helpful"""
+        review = self.get_object()
+        review.helpful_count += 1
+        review.save(update_fields=['helpful_count'])
+        return Response({'status': 'marked as helpful', 'count': review.helpful_count})
+
+
+class ConstructionUpdateViewSet(viewsets.ModelViewSet):
+    """ViewSet for Construction Updates
+    
+    Builders can create project-level updates (visible to everyone)
+    or property-specific updates (visible only to property owners)
+    """
+    serializer_class = ConstructionUpdateSerializer
+    permission_classes = [IsProjectManagerOrReadOnly]
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter, filters.SearchFilter]
+    filterset_fields = ['project', 'update_type', 'property_unit_number']
+    ordering_fields = ['update_date', 'created_at']
+    ordering = ['-update_date', '-created_at']
+    search_fields = ['title', 'description']
+    
+    def _owned_units_q(self, user):
+        """Q matching property-specific updates for the units this user bought."""
+        units = Property.objects.filter(buyer=user).values_list('project_id', 'unit_number')
+        q = Q(pk__in=[])
+        for project_id, unit_number in units:
+            q |= Q(project_id=project_id, property_unit_number=unit_number)
+        return q
+
+    def get_queryset(self):
+        """
+        - Admins see everything
+        - Everyone sees public project-level updates
+        - Builders also see every update for their own projects
+        - Buyers also see owner-only updates for the units they bought
+        """
+        user = self.request.user
+        base = ConstructionUpdate.objects.select_related('project', 'created_by')
+        if is_admin(user):
+            return base
+
+        visible = Q(update_type='project_level', visible_to_owner_only=False)
+        if user.is_authenticated:
+            developer = get_developer(user)
+            if developer is not None:
+                visible |= Q(project__developer=developer)
+            visible |= self._owned_units_q(user)
+        return base.filter(visible).distinct()
+
+    def perform_create(self, serializer):
+        """Only the builder who owns the project can post updates to it."""
+        if not manages_project(self.request.user, serializer.validated_data.get('project')):
+            raise PermissionDenied("You can only post updates for your own projects")
+        serializer.save(created_by=self.request.user)
+
+    @action(detail=False, methods=['get'])
+    def my_properties_updates(self, request):
+        """Get construction updates for buyer's owned properties"""
+        if not request.user.is_authenticated or request.user.role != 'buyer':
+            return Response({'error': 'Only buyers can access this endpoint'}, 
+                          status=status.HTTP_403_FORBIDDEN)
+        
+        # Projects where this buyer owns a unit (not merely saved/favourited ones)
+        owned_project_ids = Property.objects.filter(buyer=request.user).values_list('project_id', flat=True)
+        updates = ConstructionUpdate.objects.filter(
+            Q(project_id__in=owned_project_ids, visible_to_owner_only=False) | self._owned_units_q(request.user)
+        ).select_related('project', 'created_by').order_by('-update_date', '-created_at').distinct()
+        
+        # Apply pagination
+        page = self.paginate_queryset(updates)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(updates, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'], url_path='project/(?P<project_id>[^/.]+)')
+    def by_project(self, request, project_id=None):
+        """Get all updates for a specific project (respecting permissions)"""
+        try:
+            project = Project.objects.get(id=project_id)
+        except Project.DoesNotExist:
+            return Response({'error': 'Project not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Get base queryset with permissions applied
+        queryset = self.get_queryset().filter(project=project)
+        
+        # Apply ordering
+        queryset = queryset.order_by('-update_date', '-created_at')
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+
+class BookingViewSet(viewsets.ModelViewSet):
+    """ViewSet for Booking management"""
+    queryset = Booking.objects.select_related('property', 'property__project', 'buyer')
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['booking_number', 'property__unit_number', 'buyer__email']
+    ordering_fields = ['booking_date', 'status', 'total_amount']
+    ordering = ['-booking_date']
+    
+    # Bookings change only through create / confirm / cancel / update_payment and payments,
+    # never by editing the record directly (that would let a buyer mark themselves as paid)
+    http_method_names = ['get', 'post', 'head', 'options']
+
+    def get_serializer_class(self):
+        """Use different serializers for create vs other actions"""
+        if self.action == 'create':
+            return BookingCreateSerializer
+        return BookingSerializer
+    
+    def get_queryset(self):
+        """Filter bookings based on user role and permissions"""
+        user = self.request.user
+        queryset = super().get_queryset()
+        
+        # Buyers can only see their own bookings
+        # Builders can see bookings for their projects
+        # Admins can see all bookings
+        
+        if user.is_staff:
+            pass  # admins see everything
+        elif hasattr(user, 'developer_profile'):
+            # Builder: bookings for their projects, plus any they made themselves
+            developer = user.developer_profile
+            queryset = queryset.filter(Q(property__project__developer=developer) | Q(buyer=user))
+        else:
+            # Regular user: Show only their own bookings
+            queryset = queryset.filter(buyer=user)
+        
+        # Filter by status if provided
+        status_filter = self.request.query_params.get('status', None)
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        # Filter by property_id if provided
+        property_id = self.request.query_params.get('property_id', None)
+        if property_id:
+            queryset = queryset.filter(property_id=property_id)
+        
+        # Filter by project_id if provided
+        project_id = self.request.query_params.get('project_id', None)
+        if project_id:
+            queryset = queryset.filter(property__project_id=project_id)
+        
+        return queryset
+    
+    def perform_create(self, serializer):
+        """Set buyer to current user when creating booking"""
+        serializer.save(buyer=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        """Create with the slim serializer, but answer with the full booking (incl. its id)."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        full = BookingSerializer(serializer.instance, context=self.get_serializer_context())
+        return Response(full.data, status=status.HTTP_201_CREATED)
+    
+    @action(detail=True, methods=['post'])
+    def confirm(self, request, pk=None):
+        """Confirm a booking (builder action)"""
+        booking = self.get_object()
+        
+        # Check if user is the builder for this property
+        if not hasattr(request.user, 'developer_profile'):
+            raise PermissionDenied("Only builders can confirm bookings")
+        
+        developer = request.user.developer_profile
+        if booking.property.project.developer != developer:
+            raise PermissionDenied("You can only confirm bookings for your own projects")
+        
+        if booking.status not in ['pending', 'token_paid']:
+            return Response(
+                {'error': f'Cannot confirm booking with status: {booking.status}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        booking.status = 'confirmed'
+        if not booking.confirmation_date:
+            booking.confirmation_date = timezone.now()
+        booking.save()
+        
+        serializer = self.get_serializer(booking)
+        return Response({
+            'message': 'Booking confirmed successfully',
+            'booking': serializer.data
+        })
+    
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """Cancel a booking"""
+        booking = self.get_object()
+        
+        # Check permissions: buyer can cancel their own, builder can cancel for their projects
+        if booking.buyer != request.user:
+            if not hasattr(request.user, 'developer_profile'):
+                raise PermissionDenied("You can only cancel your own bookings")
+            developer = request.user.developer_profile
+            if booking.property.project.developer != developer:
+                raise PermissionDenied("You can only cancel bookings for your own projects")
+        
+        if booking.status in ['cancelled', 'completed', 'refunded']:
+            return Response(
+                {'error': f'Cannot cancel booking with status: {booking.status}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        cancellation_reason = request.data.get('cancellation_reason', '')
+        cancellation_initiated_by = 'buyer' if booking.buyer == request.user else 'builder'
+        
+        booking.status = 'cancelled'
+        booking.cancellation_reason = cancellation_reason
+        booking.cancellation_initiated_by = cancellation_initiated_by
+        booking.cancellation_date = timezone.now()
+        
+        # Calculate refund amount (could be token amount or full amount based on policy)
+        # For now, default to token amount
+        booking.refund_amount = booking.token_amount
+        booking.refund_status = 'pending'
+        
+        booking.save()
+        
+        serializer = self.get_serializer(booking)
+        return Response({
+            'message': 'Booking cancelled successfully',
+            'booking': serializer.data
+        })
+    
+    @action(detail=True, methods=['post'])
+    def update_payment(self, request, pk=None):
+        """Update payment information for a booking"""
+        booking = self.get_object()
+        
+        # Recording offline payments is the builder's (or an admin's) job - buyers pay
+        # through the payment gateway, otherwise they could mark their own booking as paid
+        if not manages_project(request.user, booking.property.project):
+            raise PermissionDenied("Only the project's builder can record payments for a booking")
+        
+        amount_paid = request.data.get('amount_paid')
+        payment_method = request.data.get('payment_method')
+        payment_reference = request.data.get('payment_reference')
+        payment_gateway = request.data.get('payment_gateway')
+        
+        if amount_paid is not None:
+            try:
+                from decimal import Decimal
+                amount_paid = Decimal(str(amount_paid))
+                booking.amount_paid = amount_paid
+                booking.amount_due = booking.total_amount - amount_paid
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'Invalid amount_paid value'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        if payment_method:
+            booking.payment_method = payment_method
+        if payment_reference:
+            booking.payment_reference = payment_reference
+        if payment_gateway:
+            booking.payment_gateway = payment_gateway
+        
+        # Update status based on payment progress
+        if booking.amount_paid >= booking.token_amount and booking.status == 'pending':
+            booking.status = 'token_paid'
+            booking.token_payment_date = timezone.now()
+        
+        if booking.amount_paid >= booking.total_amount and booking.status != 'completed':
+            booking.status = 'completed'
+            booking.completion_date = timezone.now()
+        elif booking.amount_paid > 0 and booking.status == 'confirmed':
+            booking.status = 'payment_in_progress'
+        
+        booking.save()
+        
+        serializer = self.get_serializer(booking)
+        return Response({
+            'message': 'Payment updated successfully',
+            'booking': serializer.data
+        })
+    
+    @action(detail=False, methods=['get'])
+    def my_bookings(self, request):
+        """Get current user's bookings"""
+        bookings = self.get_queryset().filter(buyer=request.user)
+        serializer = self.get_serializer(bookings, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def active_bookings(self, request):
+        """Get active bookings for current user or builder's projects"""
+        user = request.user
+        queryset = self.get_queryset()
+        
+        active_statuses = ['pending', 'token_paid', 'confirmed', 'agreement_pending', 
+                          'agreement_signed', 'payment_in_progress']
+        queryset = queryset.filter(status__in=active_statuses)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
